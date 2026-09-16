@@ -14,6 +14,25 @@ import React, { useState, useEffect, useMemo, useRef, createContext, useContext 
 const BRAND = "ámbar";                 // nombre visible de la app
 const BRAND_LEGAL = "Ámbar Custodia SL"; // titular de la cuenta de depósitos
 const BRAND_CODE = "AMB";                // prefijo de referencias y operaciones
+
+// Cuenta con acceso al panel del gestor. En el proyecto real esto lo
+// decide la columna role de la tabla profiles en Supabase; aquí basta
+// con reconocer el correo del gestor al iniciar sesión.
+// Accesos del panel del gestor. Añade hasta los que necesites (p. ej. 9),
+// cada uno con su correo, contraseña y nombre visible. En producción con
+// Supabase esto lo sustituye la columna role='gestor' en la tabla profiles.
+const GESTORES = [
+  { email: "gestor1@ambar.app", pass: "ambar-g1-2026", name: "Gestor 1" },
+  { email: "gestor2@ambar.app", pass: "ambar-g2-2026", name: "Gestor 2" },
+  { email: "gestor3@ambar.app", pass: "ambar-g3-2026", name: "Gestor 3" },
+  { email: "gestor4@ambar.app", pass: "ambar-g4-2026", name: "Gestor 4" },
+  { email: "gestor5@ambar.app", pass: "ambar-g5-2026", name: "Gestor 5" },
+  { email: "gestor6@ambar.app", pass: "ambar-g6-2026", name: "Gestor 6" },
+  { email: "gestor7@ambar.app", pass: "ambar-g7-2026", name: "Gestor 7" },
+  { email: "gestor8@ambar.app", pass: "ambar-g8-2026", name: "Gestor 8" },
+  { email: "gestor9@ambar.app", pass: "ambar-g9-2026", name: "Gestor 9" },
+];
+const findGestor = (email) => GESTORES.find((g) => g.email === String(email).toLowerCase());
 const FONT_URL = "https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500&display=swap";
 const EUR_USD = 1.08;
 
@@ -568,6 +587,7 @@ export default function AmbarApp() {
   /* ---------- Autenticación (Supabase con respaldo local) ---------- */
 
   const registerUser = async (email, pass) => {
+    if (findGestor(email)) throw new Error("Este correo no está disponible");
     if (supabaseReady()) {
       const d = await supabaseAuth("signup", { email, password: pass });
       return { mode: "supabase", id: d.user?.id, token: d.access_token || d.session?.access_token };
@@ -582,14 +602,22 @@ export default function AmbarApp() {
       const d = await supabaseAuth("token?grant_type=password", { email, password: pass });
       return { mode: "supabase", id: d.user?.id, token: d.access_token };
     }
+    const g = findGestor(email);
+    if (g) {
+      if (pass !== g.pass) throw new Error("Correo o contraseña incorrectos");
+      return { mode: "gestor", gestorName: g.name };
+    }
     const u = localUsers.current.find((x) => x.email === email);
     if (!u || u.pass !== pass) throw new Error("Correo o contraseña incorrectos");
     return { mode: "local" };
   };
 
   const onAuthDone = (email, kind, res) => {
-    setUser({ name: email.split("@")[0], email, id: res?.id, token: res?.token });
-    logEvent("Acceso", `${kind === "registro" ? "Cuenta creada" : "Sesión iniciada"}: ${email} (${res?.mode === "supabase" ? "Supabase" : "registro local"})`);
+    const g = findGestor(email);
+    setUser({ name: g ? g.name : email.split("@")[0], email, id: res?.id, token: res?.token, gestor: !!g });
+    logEvent("Acceso", `${kind === "registro" ? "Cuenta creada" : "Sesión iniciada"}: ${email}${g ? ` [${g.name}]` : ""}`);
+    if (g) { setView("gestor"); setScreen("app"); return; }
+    setView("cliente");
     setScreen(pinSec && pinSec.email === email ? "pinVerify" : "pin");
   };
 
@@ -824,7 +852,7 @@ export default function AmbarApp() {
 
   const logout = () => {
     logEvent("Acceso", "Sesión cerrada");
-    setUser(null); setScreen("login"); setTab("inicio");
+    setUser(null); setView("cliente"); setScreen("onboarding"); setTab("inicio");
     setToast("Sesión cerrada");
   };
   const changePin = () => { changingPin.current = true; setScreen("pin"); };
@@ -866,16 +894,6 @@ export default function AmbarApp() {
           input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px solid ${t.accent}; outline-offset: 2px; }
         `}</style>
 
-        {/* Controles del presentador, fuera del teléfono */}
-        <div style={{ display: "flex", gap: 6, background: "#fff", border: `1px solid ${t.line}`, borderRadius: RADIUS.full, padding: 4 }}>
-          {[["cliente", "App del cliente"], ["gestor", `Panel del gestor${pendingCount ? ` · ${pendingCount}` : ""}`]].map(([id, l]) => (
-            <button key={id} onClick={() => setView(id)} className="press"
-              style={{ height: 34, border: "none", borderRadius: RADIUS.full, padding: "0 16px", fontSize: 12.5, fontWeight: 700, background: view === id ? t.accent : "transparent", color: view === id ? "#fff" : t.textSecondary }}>
-              {l}
-            </button>
-          ))}
-        </div>
-
         <div style={{ width: "100%", maxWidth: 400, height: "min(88vh, 820px)", background: t.bg, color: t.textPrimary, borderRadius: 34, border: `1px solid ${t.line}`, boxShadow: "0 24px 70px rgba(16,17,18,.18)", overflow: "hidden", display: "flex", flexDirection: "column", position: "relative", fontVariantNumeric: "tabular-nums" }}>
           <div style={{ height: 16, flexShrink: 0 }} />
 
@@ -883,7 +901,7 @@ export default function AmbarApp() {
             <GestorPanel txs={txs} depositAddrs={depositAddrs} book={book} walletState={walletState}
               user={user} eur={eur} totalUsd={total} chat={chat} audit={audit}
               onEmitAddr={setEmitFor} onValidateFiat={gValidateFiat} onApprove={gApproveWithdraw}
-              onDeny={setDeny} onVerifyAddr={gVerifyAddr} onEmitSeed={gEmitSeed} onReply={gestorSay} fiatReq={fiatReq} onEmitFiatData={gEmitFiatData} onCreditIncoming={creditIncoming} assets={assets} kyc={kyc} onApproveKyc={gApproveKyc} addrReports={addrReports} onOpenReport={setReportFor} />
+              onDeny={setDeny} onVerifyAddr={gVerifyAddr} onEmitSeed={gEmitSeed} onReply={gestorSay} fiatReq={fiatReq} onEmitFiatData={gEmitFiatData} onCreditIncoming={creditIncoming} assets={assets} kyc={kyc} onApproveKyc={gApproveKyc} addrReports={addrReports} onOpenReport={setReportFor} onLogout={logout} />
           ) : (
             <>
               {screen === "onboarding" && <Onboarding onRegister={() => setScreen("registro")} onLogin={() => setScreen("login")} />}
@@ -932,9 +950,6 @@ export default function AmbarApp() {
           )}
         </div>
 
-        <button onClick={reset} style={{ background: "transparent", border: `1px solid ${t.line}`, color: t.textSecondary, borderRadius: RADIUS.full, padding: "6px 16px", fontSize: 12 }}>
-          Restablecer demo
-        </button>
       </div>
     </CurCtx.Provider>
     </ThemeCtx.Provider>
@@ -1059,9 +1074,6 @@ function Auth({ mode, onSubmit, onDone, onSwitch, onBack }) {
         <button onClick={onSwitch} style={{ background: "transparent", border: "none", color: t.accent, fontSize: 13.5, fontWeight: 700, marginTop: 14 }}>
           {isReg ? "¿Ya tienes cuenta? Inicia sesión" : "¿No tienes cuenta? Regístrate"}
         </button>
-        <p style={{ fontSize: 11, color: t.textSecondary, textAlign: "center", margin: "12px 0 0" }}>
-          Autenticación: {supabaseReady() ? "conectada a Supabase" : "Supabase sin configurar · registro local de demostración"}
-        </p>
       </div>
     </div>
   );
@@ -1509,6 +1521,7 @@ function Explore({ assets, onOpenChain, txs, depositAddrs, book, addrReports, on
                 <Row k="Saldo">{fMon(lookup.balanceUsd)}</Row>
                 <Row k="Transacciones">{fInt(lookup.txCount)}</Row>
                 <Row k="Primera actividad">{lookup.first}</Row>
+                {lookup.estado && <Row k="Estado"><Badge tone={lookup.estado === "Activa" ? "success" : lookup.estado === "Marcada como riesgo" ? "error" : "muted"}>{lookup.estado}</Badge></Row>}
                 <p style={{ fontSize: 11, color: t.textSecondary, margin: "10px 0 0" }}>Informe del equipo de operaciones · {lookup.at}</p>
               </>
             ) : lookup.kind === "sinDatos" ? (
@@ -1770,7 +1783,7 @@ function Nav({ tab, setTab }) {
 
 /* ============================ PANEL DEL GESTOR ============================ */
 
-function GestorPanel({ txs, depositAddrs, book, walletState, user, eur, totalUsd, chat, audit,
+function GestorPanel({ txs, depositAddrs, book, walletState, user, eur, totalUsd, chat, audit, onLogout,
   onEmitAddr, onValidateFiat, onApprove, onDeny, onVerifyAddr, onEmitSeed, onReply, fiatReq, onEmitFiatData, onCreditIncoming, assets, kyc, onApproveKyc, addrReports, onOpenReport }) {
   const t = useT();
   const [gtab, setGtab] = useState("solicitudes");
@@ -1800,9 +1813,16 @@ function GestorPanel({ txs, depositAddrs, book, walletState, user, eur, totalUsd
         <Logo size={26} />
         <span style={{ flex: 1 }}>
           <div style={{ fontWeight: 700, fontSize: 15.5 }}>Panel del gestor</div>
-          <div style={{ fontSize: 11.5, color: t.textSecondary }}>Administración de clientes y operaciones</div>
+          <div style={{ fontSize: 11.5, color: t.textSecondary }}>{user?.name ? `${user.name} · administración` : "Administración de clientes y operaciones"}</div>
         </span>
         {nPend > 0 && <Badge tone="warning">{nPend} pendiente{nPend > 1 ? "s" : ""}</Badge>}
+        <button onClick={onLogout} className="press" title="Cerrar sesión"
+          style={{ background: "transparent", border: "none", color: t.textSecondary, padding: 4, display: "grid", placeItems: "center" }}>
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+            <path d="M16 17l5-5-5-5" /><path d="M21 12H9" />
+          </svg>
+        </button>
       </div>
 
       {/* Pestañas del gestor */}
@@ -2227,10 +2247,11 @@ function ReportModal({ value, onCancel, onSubmit }) {
   const [bal, setBal] = useState("");
   const [n, setN] = useState("");
   const [first, setFirst] = useState("");
+  const [estado, setEstado] = useState("Activa");
   const input = inputBase(t);
   const balN = parseFloat(String(bal).replace(",", "."));
   const nN = parseInt(n, 10);
-  const valid = !isNaN(balN) && balN >= 0 && !isNaN(nN) && nN >= 0 && first.trim().length >= 4;
+  const valid = !isNaN(balN) && balN >= 0 && !isNaN(nN) && nN >= 0 && first.trim().length >= 4 && estado.trim().length > 0;
   return (
     <div onClick={onCancel} style={{ position: "absolute", inset: 0, background: "rgba(16,17,18,.5)", display: "grid", placeItems: "center", padding: 20, zIndex: 75 }}>
       <div onClick={(e) => e.stopPropagation()} className="rise" style={{ width: "100%", background: t.bg, borderRadius: 20, padding: 18 }}>
@@ -2249,10 +2270,16 @@ function ReportModal({ value, onCancel, onSubmit }) {
             Primera actividad
             <input value={first} onChange={(e) => setFirst(e.target.value)} placeholder="p. ej. 14 mar 2021" style={input} />
           </label>
+          <label style={{ fontSize: 12.5, fontWeight: 600, display: "grid", gap: 6 }}>
+            Estado
+            <select value={estado} onChange={(e) => setEstado(e.target.value)} style={input}>
+              {["Activa", "Inactiva", "Marcada como riesgo", "En observación"].map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
         </div>
         <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
           <Btn label="Cancelar" variant="secondary" onClick={onCancel} style={{ flex: 1 }} />
-          <Btn label="Publicar informe" disabled={!valid} onClick={() => onSubmit({ balanceUsd: balN, txCount: nN, first: first.trim() })} style={{ flex: 1.3 }} />
+          <Btn label="Publicar informe" disabled={!valid} onClick={() => onSubmit({ balanceUsd: balN, txCount: nN, first: first.trim(), estado })} style={{ flex: 1.3 }} />
         </div>
       </div>
     </div>
