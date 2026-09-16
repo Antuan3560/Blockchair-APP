@@ -63,6 +63,17 @@ async function supabaseAuth(path, body) {
 }
 const supabaseReady = () => SUPABASE_URL.startsWith("https://") && SUPABASE_ANON_KEY.length > 20;
 
+// Lee el perfil propio (rol, nombre, gestor asignado) desde Supabase.
+async function fetchProfile(token, id) {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${id}&select=role,display_name,assigned_gestor,pin_salt,pin_hash`, {
+      headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
+    });
+    const rows = await r.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch (e) { return null; }
+}
+
 /* ------------------------- Tokens (tema único claro) ------------------------- */
 
 const T0 = {
@@ -612,9 +623,24 @@ export default function AmbarApp() {
     return { mode: "local" };
   };
 
-  const onAuthDone = (email, kind, res) => {
+  const onAuthDone = async (email, kind, res) => {
+    // Con Supabase, el rol lo decide la tabla profiles (matriz/gestor/cliente).
+    if (res?.mode === "supabase" && res?.token && res?.id) {
+      const prof = await fetchProfile(res.token, res.id);
+      const role = prof?.role || "cliente";
+      const name = prof?.display_name || email.split("@")[0];
+      setUser({ name, email, id: res.id, token: res.token, role, assignedGestor: prof?.assigned_gestor || null });
+      logEvent("Acceso", `Sesión: ${email} [${role}]`);
+      if (role === "matriz" || role === "gestor") { setView("gestor"); setScreen("app"); return; }
+      // cliente: PIN. Si ya tiene hash en el perfil, verificar; si no, crear.
+      if (prof?.pin_hash && prof?.pin_salt) { setPinSec({ email, salt: prof.pin_salt, hash: prof.pin_hash }); setScreen("pinVerify"); }
+      else setScreen(pinSec && pinSec.email === email ? "pinVerify" : "pin");
+      setView("cliente");
+      return;
+    }
+    // Sin Supabase: modo local con la lista de gestores de ejemplo.
     const g = findGestor(email);
-    setUser({ name: g ? g.name : email.split("@")[0], email, id: res?.id, token: res?.token, gestor: !!g });
+    setUser({ name: g ? g.name : email.split("@")[0], email, id: res?.id, token: res?.token, role: g ? "gestor" : "cliente" });
     logEvent("Acceso", `${kind === "registro" ? "Cuenta creada" : "Sesión iniciada"}: ${email}${g ? ` [${g.name}]` : ""}`);
     if (g) { setView("gestor"); setScreen("app"); return; }
     setView("cliente");
