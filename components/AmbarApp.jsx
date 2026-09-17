@@ -82,7 +82,7 @@ const sbHeaders = (token) => ({
   "Content-Type": "application/json",
 });
 const rowToTx = (r) => ({
-  id: r.id, kind: r.kind, type: r.type, coin: r.coin, sym: r.sym,
+  id: r.id, _uid: r.user_id, kind: r.kind, type: r.type, coin: r.coin, sym: r.sym,
   amount: Number(r.amount), valueUsd: r.value_usd != null ? Number(r.value_usd) : undefined,
   valueEur: r.kind === "fiat" ? Number(r.amount) : undefined,
   feeUsd: r.fee_usd != null ? Number(r.fee_usd) : undefined,
@@ -198,6 +198,36 @@ async function dbLoadTxsOf(token, uid) {
   return Array.isArray(rows) ? rows.map(rowToTx) : [];
 }
 
+/* ---- chat de soporte ---- */
+async function dbLoadMsgs(token, uid) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/messages?user_id=eq.${uid}&order=created_at.asc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbInsertMsg(token, uid, sender, body) {
+  await fetch(`${SUPABASE_URL}/rest/v1/messages`, {
+    method: "POST", headers: sbHeaders(token),
+    body: JSON.stringify([{ user_id: uid, sender, body }]),
+  });
+}
+/* ---- notificaciones ---- */
+async function dbLoadNotis(token, uid) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/notifications?user_id=eq.${uid}&order=created_at.desc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbInsertNoti(token, uid, body) {
+  await fetch(`${SUPABASE_URL}/rest/v1/notifications`, {
+    method: "POST", headers: sbHeaders(token),
+    body: JSON.stringify([{ user_id: uid, body }]),
+  });
+}
+async function dbMarkNotisRead(token, uid) {
+  await fetch(`${SUPABASE_URL}/rest/v1/notifications?user_id=eq.${uid}&read=eq.false`, {
+    method: "PATCH", headers: sbHeaders(token), body: JSON.stringify({ read: true }),
+  });
+}
+
 /* ------------------------- Tokens (tema único claro) ------------------------- */
 
 const T0 = {
@@ -272,6 +302,7 @@ const opNum = () => `${BRAND_CODE}-${new Date().getFullYear()}-${Math.floor(1000
 const hhmm = () => new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
 const fecha = () => new Date().toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).replace(".", "");
 const fmtDate = (iso) => iso ? new Date(iso).toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).replace(".", "") : fecha();
+const fmtTime = (iso) => iso ? new Date(iso).toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" }) : hhmm();
 
 const SEED_WORDS = ["amber", "ocean", "forest", "quiet", "metal", "sunset", "river", "cargo", "violet", "humble", "spark", "granite", "meadow", "copper", "lunar", "harbor", "cedar", "prairie", "ember", "willow", "canyon", "fable", "saffron", "tide"];
 const genSeed = () => {
@@ -670,6 +701,17 @@ export default function AmbarApp() {
   const [gTxs, setGTxs] = useState([]);              // movimientos de sus clientes
   const [gGestores, setGGestores] = useState([]);    // lista de gestores (para asignar)
   const [gEmitRow, setGEmitRow] = useState(null);    // fila addresses que el gestor va a emitir
+  const [gChatClient, setGChatClient] = useState(null); // cliente cuyo chat abre el gestor
+  const [gChatMsgs, setGChatMsgs] = useState([]);
+  const gOpenChat = async (client) => {
+    setGChatClient(client);
+    if (isSb()) { try { setGChatMsgs(await dbLoadMsgs(user.token, client.id)); } catch (e) { setGChatMsgs([]); } }
+  };
+  const gSendChat = async (body) => {
+    if (!isSb() || !gChatClient) return;
+    await dbInsertMsg(user.token, gChatClient.id, "gestor", body);
+    setGChatMsgs(await dbLoadMsgs(user.token, gChatClient.id));
+  };
   const [gLoading, setGLoading] = useState(false);
   const gestorReload = async () => {
     if (!isSb() || !(user?.role === "gestor" || user?.role === "matriz")) return;
@@ -700,7 +742,9 @@ export default function AmbarApp() {
   // Acciones del gestor sobre datos reales (escriben en Supabase y recargan)
   const gEmitAddrDb = async (addrRowId, addr) => {
     if (!isSb()) return;
+    const row = gAddrs.find((a) => a.id === addrRowId);
     await dbUpdateAddr(user.token, addrRowId, { address: addr, status: "lista" });
+    if (row) await dbInsertNoti(user.token, row.user_id, `Tu dirección de depósito de ${row.coin.toUpperCase()} ya está disponible en Depositar → Cripto.`).catch(() => {});
     await gestorReload();
     setToast("Dirección emitida");
   };
@@ -711,19 +755,24 @@ export default function AmbarApp() {
       valueUsd: amount * a.price, status: "confirmada", op: opNum(),
       hash: randHex(64), to: null, feeUsd: a.fee, conf: 40 + Math.floor(Math.random() * 500) };
     await dbInsertTx(user.token, clientId, tx);
+    await dbInsertNoti(user.token, clientId, `Detectamos y acreditamos tu depósito entrante de ${fNum(amount)} ${a.sym}.`).catch(() => {});
     await gestorReload();
     setToast(`Acreditado ${fNum(amount)} ${a.sym}`);
   };
   const gApproveWithdrawDb = async (txRowId, kind) => {
     if (!isSb()) return;
+    const row = gTxs.find((x) => x.id === txRowId);
     const extra = kind === "cripto" ? { hash: randHex(64), conf: 24 + Math.floor(Math.random() * 300) } : {};
     await dbUpdateTx(user.token, txRowId, { status: "confirmada", ...extra });
+    if (row) await dbInsertNoti(user.token, row._uid || row.user_id, `Tu retiro ${row.op} fue aprobado.`).catch(() => {});
     await gestorReload();
     setToast("Retiro aprobado");
   };
   const gValidateFiatDb = async (txRowId) => {
     if (!isSb()) return;
+    const row = gTxs.find((x) => x.id === txRowId);
     await dbUpdateTx(user.token, txRowId, { status: "confirmada" });
+    if (row) await dbInsertNoti(user.token, row._uid || row.user_id, `Validamos tu transferencia de ${fEur(row.amount)}. El saldo ya está disponible.`).catch(() => {});
     await gestorReload();
     setToast("Depósito validado");
   };
@@ -754,8 +803,9 @@ export default function AmbarApp() {
   const [notisUnread, setNotisUnread] = useState(0);
   const noid = useRef(0);
   const notify = (text) => {
-    setNotis((p) => [{ id: ++noid.current, text, at: hhmm() }, ...p]);
+    setNotis((p) => [{ id: Date.now(), text, at: hhmm() }, ...p]);
     setNotisUnread((n) => n + 1);
+    if (isSb() && view === "cliente" && user?.id) dbInsertNoti(user.token, user.id, text).catch(() => {});
   };
 
   const [sheet, setSheet] = useState(null);
@@ -779,6 +829,7 @@ export default function AmbarApp() {
     setChat((p) => [...p, { id: ++cid.current, from: "gestor", text, at: hhmm() }]);
   const userSay = (text) => {
     setChat((p) => [...p, { id: ++cid.current, from: "yo", text, at: hhmm() }]);
+    if (isSb() && user?.id) dbInsertMsg(user.token, user.id, "cliente", text).catch(() => {});
     logEvent("Soporte", "Mensaje del cliente en el chat");
   };
 
@@ -856,9 +907,54 @@ export default function AmbarApp() {
         if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
         const kycReq = reqs.find((q) => q.kind === "kyc_n2");
         if (kycReq) setKyc({ level: kycReq.status === "resuelta" ? 2 : 1, status: kycReq.status === "pendiente" || kycReq.status === "emitida" ? "pendiente" : "ok" });
+
+        // Chat de soporte y notificaciones
+        const msgs = await dbLoadMsgs(user.token, user.id);
+        if (cancel) return;
+        if (msgs.length) setChat(msgs.map((m) => ({ id: m.id, from: m.sender === "gestor" ? "gestor" : "yo", text: m.body, at: fmtTime(m.created_at) })));
+        const nt = await dbLoadNotis(user.token, user.id);
+        if (cancel) return;
+        setNotis(nt.map((n) => ({ id: n.id, text: n.body, at: fmtTime(n.created_at) })));
+        setNotisUnread(nt.filter((n) => !n.read).length);
       } catch (err) { /* silencioso: la app sigue en modo local */ }
     })();
     return () => { cancel = true; };
+  }, [screen, view, user?.id]);
+
+  // Refresco periódico del cliente: trae del servidor lo que el gestor haya
+  // cambiado (saldos, notificaciones, chat) sin que el cliente recargue.
+  useEffect(() => {
+    if (screen !== "app" || view !== "cliente" || !isSb()) return;
+    const iv = setInterval(async () => {
+      try {
+        const [loaded, nt, msgs] = await Promise.all([
+          dbLoadTxs(user.token, user.id),
+          dbLoadNotis(user.token, user.id),
+          dbLoadMsgs(user.token, user.id),
+        ]);
+        setTxs(loaded);
+        setAssets((prev) => prev.map((a) => {
+          let amt = 0;
+          for (const tx of loaded) {
+            if (tx.coin !== a.id || tx.kind !== "cripto") continue;
+            if (tx.status === "confirmada") amt += tx.type === "deposito" ? tx.amount : -tx.amount;
+            else if (tx.status === "pendiente" && tx.type === "retiro") amt -= tx.amount;
+          }
+          return { ...a, amount: Math.max(amt, 0) };
+        }));
+        let e = 0;
+        for (const tx of loaded) {
+          if (tx.kind !== "fiat") continue;
+          if (tx.status === "confirmada") e += tx.type === "deposito" ? tx.amount : -tx.amount;
+          else if (tx.status === "pendiente" && tx.type === "retiro") e -= tx.amount;
+        }
+        setEur(Math.max(e, 0));
+        setNotis(nt.map((n) => ({ id: n.id, text: n.body, at: fmtTime(n.created_at) })));
+        setNotisUnread(nt.filter((n) => !n.read).length);
+        if (msgs.length) setChat(msgs.map((m) => ({ id: m.id, from: m.sender === "gestor" ? "gestor" : "yo", text: m.body, at: fmtTime(m.created_at) })));
+      } catch (e) { /* silencioso */ }
+    }, 8000);
+    return () => clearInterval(iv);
   }, [screen, view, user?.id]);
 
   const cryptoUsd = assets.reduce((s, a) => s + a.price * a.amount, 0);
@@ -1225,7 +1321,8 @@ export default function AmbarApp() {
                 onDeny={setDeny} onLogout={logout}
                 onAssign={async (cid, gid) => { await dbAssignClient(user.token, cid, gid); await gestorReload(); setToast("Cliente asignado"); }}
                 onOpenEmit={(row) => setGEmitRow(row)}
-                onCreditClient={gCreditClientDb} />
+                onCreditClient={gCreditClientDb}
+                chatClient={gChatClient} chatMsgs={gChatMsgs} onOpenChat={gOpenChat} onSendChat={gSendChat} onCloseChat={() => setGChatClient(null)} />
             ) : (
             <GestorPanel txs={txs} depositAddrs={depositAddrs} book={book} walletState={walletState}
               user={user} eur={eur} totalUsd={total} chat={chat} audit={audit}
@@ -1244,7 +1341,7 @@ export default function AmbarApp() {
                 <>
                   <div className="nosb" style={{ flex: 1, overflowY: "auto", paddingBottom: 84 }}>
                     {tab === "inicio" && <Home assets={assets} movers={movers} total={total} eur={eur} user={user}
-                      onDeposit={() => setSheet("depositar")} onWithdraw={() => setSheet("retirar")} txs={txs} onTx={setTxDetail} onOpenNotis={() => { setNotisOpen(true); setNotisUnread(0); }} unread={notisUnread} />}
+                      onDeposit={() => setSheet("depositar")} onWithdraw={() => setSheet("retirar")} txs={txs} onTx={setTxDetail} onOpenNotis={() => { setNotisOpen(true); setNotisUnread(0); if (isSb() && user?.id) dbMarkNotisRead(user.token, user.id).catch(() => {}); }} unread={notisUnread} />}
                     {tab === "billetera" && <WalletPage walletState={walletState} seed={seed} onRequestWallet={requestWallet} onConfirmSeed={confirmSeed}
                       book={book} onAddEntry={addBookEntry} setToast={setToast} />}
                     {tab === "explorar" && <Explore assets={assets} onOpenChain={setChainSheet} txs={txs} depositAddrs={depositAddrs} book={book} addrReports={addrReports} onRequestReport={requestAddrReport} />}
@@ -2117,7 +2214,8 @@ function Nav({ tab, setTab }) {
 
 function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, loading, onReload,
   onEmitFiatData, onValidateFiat, onApproveWithdraw, onVerifyAddr,
-  onResolveReq, onDeny, onLogout, onAssign, onOpenEmit, onCreditClient }) {
+  onResolveReq, onDeny, onLogout, onAssign, onOpenEmit, onCreditClient,
+  chatClient, chatMsgs, onOpenChat, onSendChat, onCloseChat }) {
   const t = useT();
   const [gtab, setGtab] = useState("solicitudes");
 
@@ -2164,6 +2262,7 @@ function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, load
       <div style={{ display: "flex", gap: 16, borderBottom: `1px solid ${t.line}`, marginBottom: 4 }}>
         {tabBtn("solicitudes", "Solicitudes")}
         {tabBtn("clientes", "Clientes")}
+        {tabBtn("soporte", "Soporte")}
         {user?.role === "matriz" && tabBtn("asignar", "Asignar")}
       </div>
 
@@ -2336,6 +2435,47 @@ function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, load
         </div>
       )}
 
+      {gtab === "soporte" && (
+        <div className="rise" style={{ marginTop: 12 }}>
+          {chatClient ? (
+            <div>
+              <button onClick={onCloseChat} style={{ background: "transparent", border: "none", color: t.textSecondary, fontSize: 13, padding: "0 0 10px" }}>‹ Conversaciones</button>
+              <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 2 }}>{chatClient.display_name || chatClient.email.split("@")[0]}</div>
+              <div style={{ fontSize: 11, color: t.textSecondary, fontFamily: FONT.mono, marginBottom: 10 }}>{chatClient.email}</div>
+              <div style={{ background: t.cardSurface, borderRadius: RADIUS.card, padding: 12, minHeight: 200, maxHeight: 340, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+                {chatMsgs.length === 0 && <span style={{ fontSize: 12.5, color: t.textSecondary, margin: "auto" }}>Sin mensajes todavía.</span>}
+                {chatMsgs.map((m) => (
+                  <div key={m.id} style={{ alignSelf: m.sender === "gestor" ? "flex-end" : "flex-start", maxWidth: "78%",
+                    background: m.sender === "gestor" ? t.accent : t.bg, color: m.sender === "gestor" ? t.textOnAccent : t.textPrimary,
+                    padding: "8px 12px", borderRadius: 14, fontSize: 13, border: m.sender === "gestor" ? "none" : `1px solid ${t.line}` }}>
+                    {m.body}
+                    <div style={{ fontSize: 9.5, opacity: 0.7, marginTop: 3, textAlign: "right" }}>{fmtTime(m.created_at)}</div>
+                  </div>
+                ))}
+              </div>
+              <GestorChatInput onSend={onSendChat} />
+            </div>
+          ) : (
+            <>
+              {clients.length === 0 && <Card style={{ padding: 20, textAlign: "center" }}><span style={{ fontSize: 13, color: t.textSecondary }}>Sin clientes para atender.</span></Card>}
+              {clients.map((c) => (
+                <button key={c.id} onClick={() => onOpenChat(c)} className="press"
+                  style={{ width: "100%", textAlign: "left", background: t.cardSurface, border: "none", borderRadius: RADIUS.card, padding: 14, marginBottom: 8, display: "flex", alignItems: "center", gap: 12, color: t.textPrimary }}>
+                  <span style={{ width: 38, height: 38, borderRadius: 99, background: "rgba(30,125,247,0.12)", color: t.accent, display: "grid", placeItems: "center", fontWeight: 700 }}>
+                    {(c.display_name || c.email)[0].toUpperCase()}
+                  </span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>{c.display_name || c.email.split("@")[0]}</div>
+                    <div style={{ fontSize: 11, color: t.textSecondary, fontFamily: FONT.mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.email}</div>
+                  </span>
+                  <span style={{ color: t.textSecondary }}>›</span>
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+
       {gtab === "asignar" && user?.role === "matriz" && (
         <AssignTab clients={clients} gestores={gestores} onAssign={onAssign} />
       )}
@@ -2369,6 +2509,19 @@ function ClientCredit({ client, addrs, assets, onCredit }) {
       {valid && <div style={{ fontSize: 11, color: t.textSecondary }}>Equivale a {fMon(num * sel.price)}</div>}
       <Btn label={valid ? `Acreditar ${fNum(num)} ${coin.toUpperCase()}` : "Acreditar"} disabled={!valid}
         onClick={() => { onCredit(client.id, coin, num); setAmount(""); }} style={{ width: "100%", height: 40, fontSize: 12.5 }} />
+    </div>
+  );
+}
+
+function GestorChatInput({ onSend }) {
+  const t = useT();
+  const [text, setText] = useState("");
+  const send = () => { const v = text.trim(); if (!v) return; onSend(v); setText(""); };
+  return (
+    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+      <input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()}
+        placeholder="Escribe una respuesta…" style={{ ...inputBase(t), flex: 1 }} />
+      <Btn label="Enviar" onClick={send} style={{ width: 90 }} />
     </div>
   );
 }
