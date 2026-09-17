@@ -124,6 +124,80 @@ async function dbUpdateTx(token, id, patch) {
   });
 }
 
+/* ---- addresses (direcciones de depósito y de retiro) ---- */
+async function dbLoadAddrs(token, uid) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/addresses?user_id=eq.${uid}&order=created_at.desc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbInsertAddr(token, uid, a) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/addresses`, {
+    method: "POST", headers: { ...sbHeaders(token), Prefer: "return=representation" },
+    body: JSON.stringify([{ user_id: uid, purpose: a.purpose, coin: a.coin, chain: a.chain || null, label: a.label || null, address: a.address || null, status: a.status || "pendiente" }]),
+  });
+  const rows = await r.json();
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+async function dbUpdateAddr(token, id, patch) {
+  const row = { ...patch };
+  if (patch.status === "verificada" || patch.status === "rechazada" || patch.status === "lista") row.resolved_at = new Date().toISOString();
+  await fetch(`${SUPABASE_URL}/rest/v1/addresses?id=eq.${id}`, {
+    method: "PATCH", headers: sbHeaders(token), body: JSON.stringify(row),
+  });
+}
+
+/* ---- requests (datos fiat, billetera, kyc, informe) ---- */
+async function dbLoadReqs(token, uid) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/requests?user_id=eq.${uid}&order=created_at.desc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbInsertReq(token, uid, q) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/requests`, {
+    method: "POST", headers: { ...sbHeaders(token), Prefer: "return=representation" },
+    body: JSON.stringify([{ user_id: uid, kind: q.kind, payload: q.payload || {}, status: q.status || "pendiente" }]),
+  });
+  const rows = await r.json();
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+async function dbUpdateReq(token, id, patch) {
+  const row = { ...patch };
+  if (patch.status && patch.status !== "pendiente") row.resolved_at = new Date().toISOString();
+  await fetch(`${SUPABASE_URL}/rest/v1/requests?id=eq.${id}`, {
+    method: "PATCH", headers: sbHeaders(token), body: JSON.stringify(row),
+  });
+}
+
+/* ---- lista de clientes para el panel del gestor ---- */
+async function dbLoadClients(token, role, myId) {
+  // matriz ve todos; gestor ve los asignados a él (RLS lo refuerza)
+  const filter = role === "matriz" ? "role=eq.cliente" : `role=eq.cliente&assigned_gestor=eq.${myId}`;
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/profiles?${filter}&select=id,email,display_name,assigned_gestor&order=created_at.desc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbLoadUnassigned(token) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/profiles?role=eq.cliente&assigned_gestor=is.null&select=id,email,display_name`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbLoadGestores(token) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/profiles?role=eq.gestor&select=id,email,display_name`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows : [];
+}
+async function dbAssignClient(token, clientId, gestorId) {
+  await fetch(`${SUPABASE_URL}/rest/v1/profiles?id=eq.${clientId}`, {
+    method: "PATCH", headers: sbHeaders(token), body: JSON.stringify({ assigned_gestor: gestorId }),
+  });
+}
+// Movimientos de un cliente concreto (para el perfil en el panel)
+async function dbLoadTxsOf(token, uid) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/transactions?user_id=eq.${uid}&order=created_at.desc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows.map(rowToTx) : [];
+}
+
 /* ------------------------- Tokens (tema único claro) ------------------------- */
 
 const T0 = {
@@ -197,6 +271,7 @@ const randAddr = (chain) => (chain === "btc" ? "bc1q" + randHex(32) : chain === 
 const opNum = () => `${BRAND_CODE}-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 89999)}`;
 const hhmm = () => new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
 const fecha = () => new Date().toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).replace(".", "");
+const fmtDate = (iso) => iso ? new Date(iso).toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).replace(".", "") : fecha();
 
 const SEED_WORDS = ["amber", "ocean", "forest", "quiet", "metal", "sunset", "river", "cargo", "violet", "humble", "spark", "granite", "meadow", "copper", "lunar", "harbor", "cedar", "prairie", "ember", "willow", "canyon", "fable", "saffron", "tide"];
 const genSeed = () => {
@@ -670,6 +745,34 @@ export default function AmbarApp() {
           else if (t.status === "pendiente" && t.type === "retiro") e -= t.amount;
         }
         setEur(Math.max(e, 0));
+
+        // Direcciones (depósito emitidas + lista blanca de retiro)
+        const addrs = await dbLoadAddrs(user.token, user.id);
+        if (cancel) return;
+        const dep = {};
+        const wl = [];
+        for (const a of addrs) {
+          if (a.purpose === "deposito") {
+            dep[a.coin] = { status: a.status === "lista" ? "lista" : "pendiente", addr: a.address || undefined, at: fmtDate(a.created_at), _id: a.id };
+          } else {
+            wl.push({ id: a.id, chain: a.coin, label: a.label, addr: a.address, status: a.status === "verificada" ? "verificada" : a.status === "rechazada" ? "rechazada" : "verificacion", reason: a.reason || undefined, at: fmtDate(a.created_at) });
+          }
+        }
+        setDepositAddrs(dep);
+        setBook(wl);
+
+        // Solicitudes (datos fiat, billetera, kyc)
+        const reqs = await dbLoadReqs(user.token, user.id);
+        if (cancel) return;
+        const fiatPend = reqs.find((q) => q.kind === "datos_fiat" && q.status !== "resuelta" && q.status !== "denegada");
+        if (fiatPend) {
+          const r = fiatPend.result || {};
+          setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", titular: r.titular, iban: r.iban, ref: r.ref, at: fmtDate(fiatPend.created_at) });
+        }
+        const wallet = reqs.find((q) => q.kind === "billetera");
+        if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
+        const kycReq = reqs.find((q) => q.kind === "kyc_n2");
+        if (kycReq) setKyc({ level: kycReq.status === "resuelta" ? 2 : 1, status: kycReq.status === "pendiente" || kycReq.status === "emitida" ? "pendiente" : "ok" });
       } catch (err) { /* silencioso: la app sigue en modo local */ }
     })();
     return () => { cancel = true; };
@@ -754,8 +857,9 @@ export default function AmbarApp() {
 
   /* ---------- Solicitudes del cliente (quedan pendientes) ---------- */
 
-  const requestDepositAddr = (coin) => {
+  const requestDepositAddr = async (coin) => {
     setDepositAddrs((p) => ({ ...p, [coin]: { status: "pendiente", at: fecha() } }));
+    if (isSb()) { try { await dbInsertAddr(user.token, user.id, { purpose: "deposito", coin, chain: chainOf(coin), status: "pendiente" }); } catch (e) {} }
     logEvent("Ingreso", `Solicitud de dirección de depósito: ${coin.toUpperCase()}`);
     setToast(`Solicitud enviada (${coin.toUpperCase()}). Pendiente de emisión.`);
   };
