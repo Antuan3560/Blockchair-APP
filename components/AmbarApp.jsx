@@ -731,6 +731,7 @@ export default function AmbarApp() {
   const [gMsgs, setGMsgs] = useState([]); // últimos mensajes de clientes (para el aviso)
   const [gMsgsSeen, setGMsgsSeen] = useState(0); // id máximo visto
   const [gReportRow, setGReportRow] = useState(null); // solicitud de informe a rellenar
+  const [gFiatRow, setGFiatRow] = useState(null); // solicitud de datos fiat a emitir
   const gOpenChat = async (client) => {
     setGChatClient(client);
     if (isSb()) { try { setGChatMsgs(await dbLoadMsgs(user.token, client.id)); } catch (e) { setGChatMsgs([]); } }
@@ -820,10 +821,11 @@ export default function AmbarApp() {
     await dbUpdateReq(user.token, rowId, patch);
     await gestorReload();
   };
-  const gEmitFiatDataDb = async (reqRowId) => {
+  const gEmitFiatDataDb = async (reqRowId, data) => {
     if (!isSb()) return;
-    const ref = `${BRAND_CODE}-REF-` + Math.floor(100000 + Math.random() * 899999);
-    await dbUpdateReq(user.token, reqRowId, { status: "emitida", result: { titular: BRAND_LEGAL, iban: "ES91 2100 0418 4502 0005 1332", ref } });
+    const row = gReqs.find((r) => r.id === reqRowId);
+    await dbUpdateReq(user.token, reqRowId, { status: "emitida", result: data });
+    if (row) await dbInsertNoti(user.token, row.user_id, "Los datos bancarios para tu depósito ya están disponibles en Depositar → Fiat.").catch(() => {});
     await gestorReload();
     setToast("Datos bancarios emitidos");
   };
@@ -950,7 +952,7 @@ export default function AmbarApp() {
         const fiatPend = reqs.find((q) => q.kind === "datos_fiat" && q.status !== "resuelta" && q.status !== "denegada");
         if (fiatPend) {
           const r = fiatPend.result || {};
-          setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", titular: r.titular, iban: r.iban, ref: r.ref, at: fmtDate(fiatPend.created_at) });
+          setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", beneficiario: r.beneficiario, titular: r.titular, iban: r.iban, bic: r.bic, ref: r.ref, at: fmtDate(fiatPend.created_at) });
         }
         const wallet = reqs.find((q) => q.kind === "billetera");
         if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
@@ -1023,7 +1025,7 @@ export default function AmbarApp() {
         setDepositAddrs(dep);
         setBook(wl);
         const fiatPend = reqs.find((q) => q.kind === "datos_fiat" && q.status !== "resuelta" && q.status !== "denegada");
-        if (fiatPend) { const rr = fiatPend.result || {}; setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", titular: rr.titular, iban: rr.iban, ref: rr.ref, at: fmtDate(fiatPend.created_at) }); }
+        if (fiatPend) { const rr = fiatPend.result || {}; setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", beneficiario: rr.beneficiario, titular: rr.titular, iban: rr.iban, bic: rr.bic, ref: rr.ref, at: fmtDate(fiatPend.created_at) }); }
         const wallet = reqs.find((q) => q.kind === "billetera");
         if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
         const reps = {};
@@ -1400,7 +1402,7 @@ export default function AmbarApp() {
             isSb() ? (
               <GestorPanelDb user={user} clients={gClients} addrs={gAddrs} reqs={gReqs} txs={gTxs}
                 gestores={gGestores} assets={assets} loading={gLoading} onReload={gestorReload}
-                onEmitFiatData={gEmitFiatDataDb} onValidateFiat={gValidateFiatDb}
+                onEmitFiatData={(reqId) => { const r = gReqs.find((x) => x.id === reqId); setGFiatRow(r); }} onValidateFiat={gValidateFiatDb}
                 onApproveWithdraw={gApproveWithdrawDb} onVerifyAddr={gVerifyAddrDb}
                 onResolveReq={(id, patch) => gResolveDb(null, id, patch)}
                 onDeny={setDeny} onLogout={logout}
@@ -1458,6 +1460,8 @@ export default function AmbarApp() {
             onSubmit={(addr) => { gEmitAddrDb(gEmitRow.id, addr); setGEmitRow(null); }} />}
           {gReportRow && <ReportModal value={(gReportRow.payload || {}).address} onCancel={() => setGReportRow(null)}
             onSubmit={(data) => { gFillReportDb(gReportRow.id, data); setGReportRow(null); }} />}
+          {gFiatRow && <EmitFiatModal amount={(gFiatRow.payload || {}).amount} onCancel={() => setGFiatRow(null)}
+            onSubmit={(data) => { gEmitFiatDataDb(gFiatRow.id, data); setGFiatRow(null); }} />}
           {reportFor && <ReportModal value={reportFor} onCancel={() => setReportFor(null)}
             onSubmit={(data) => { gFillAddrReport(reportFor, data); setReportFor(null); }} />}
 
@@ -3096,6 +3100,45 @@ const ADDR_RULES = {
   trx: { re: /^T[1-9A-HJ-NP-Za-km-z]{33}$/, hint: "empieza por T y 34 caracteres (Tron TRC-20)" },
 };
 
+function EmitFiatModal({ amount, onCancel, onSubmit }) {
+  const t = useT();
+  const [beneficiario, setBeneficiario] = useState("");
+  const [iban, setIban] = useState("");
+  const [bic, setBic] = useState("");
+  const [ref, setRef] = useState("");
+  const input = inputBase(t);
+  const valid = beneficiario.trim() && iban.trim().length >= 15 && bic.trim().length >= 8 && ref.trim();
+  const field = (label, val, set, ph, mono) => (
+    <label style={{ fontSize: 12.5, fontWeight: 600, display: "grid", gap: 6 }}>
+      {label}
+      <input value={val} onChange={(e) => set(e.target.value)} placeholder={ph}
+        style={{ ...input, fontFamily: mono ? FONT.mono : "inherit" }} />
+    </label>
+  );
+  return (
+    <div onClick={onCancel} style={{ position: "absolute", inset: 0, background: "rgba(16,17,18,.5)", display: "grid", placeItems: "center", padding: 20, zIndex: 75 }}>
+      <div onClick={(e) => e.stopPropagation()} className="rise" style={{ width: "100%", background: t.bg, borderRadius: 20, padding: 18, maxHeight: "88%", overflowY: "auto" }}>
+        <div style={{ fontWeight: 700, fontSize: 15 }}>Emitir datos de depósito</div>
+        <div style={{ fontSize: 11.5, color: t.textSecondary, margin: "4px 0 12px" }}>
+          Depósito de {fEur(amount || 0)}. Introduce los datos bancarios para esta operación. Serán de un solo uso.
+        </div>
+        <div style={{ display: "grid", gap: 10 }}>
+          {field("Beneficiario", beneficiario, setBeneficiario, "Titular de la cuenta")}
+          {field("IBAN", iban, setIban, "ES00 0000 0000 0000 0000 0000", true)}
+          {field("BIC / SWIFT", bic, setBic, "XXXXESMMXXX", true)}
+          {field("Referencia / Concepto", ref, setRef, "Concepto obligatorio", true)}
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <Btn label="Cancelar" variant="secondary" onClick={onCancel} style={{ flex: 1 }} />
+          <Btn label="Emitir datos" disabled={!valid}
+            onClick={() => onSubmit({ beneficiario: beneficiario.trim(), iban: iban.trim(), bic: bic.trim(), ref: ref.trim() })}
+            style={{ flex: 1.4 }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function EmitAddrModal({ coin, onCancel, onSubmit }) {
   const t = useT();
   const [addr, setAddr] = useState("");
@@ -3298,7 +3341,7 @@ function DepositSheet({ assets, depositAddrs, onRequestAddr, fiatReq, onRequestF
               <span style={{ fontSize: 12, color: t.textSecondary }}>Datos para tu depósito de {fEur(fiatReq.amount)}</span>
               <Badge tone="success">Datos listos</Badge>
             </div>
-            {[["Titular", fiatReq.titular], ["IBAN", fiatReq.iban], ["Concepto (obligatorio)", fiatReq.ref]].map(([k, v]) => (
+            {[["Beneficiario", fiatReq.beneficiario || fiatReq.titular], ["IBAN", fiatReq.iban], ["BIC / SWIFT", fiatReq.bic], ["Referencia (obligatoria)", fiatReq.ref]].filter(([, v]) => v).map(([k, v]) => (
               <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "5px 0" }}>
                 <span style={{ fontSize: 12, color: t.textSecondary, flexShrink: 0 }}>{k}</span>
                 <span style={{ fontSize: 12, fontFamily: FONT.mono, textAlign: "right", wordBreak: "break-all" }}>{v}</span>
