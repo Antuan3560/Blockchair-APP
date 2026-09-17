@@ -74,6 +74,56 @@ async function fetchProfile(token, id) {
   } catch (e) { return null; }
 }
 
+/* ---- Capa de datos: tabla transactions en Supabase (REST) ----
+   Convierte entre el formato de la BD (snake_case) y el de la app. */
+const sbHeaders = (token) => ({
+  apikey: SUPABASE_ANON_KEY,
+  Authorization: `Bearer ${token || SUPABASE_ANON_KEY}`,
+  "Content-Type": "application/json",
+});
+const rowToTx = (r) => ({
+  id: r.id, kind: r.kind, type: r.type, coin: r.coin, sym: r.sym,
+  amount: Number(r.amount), valueUsd: r.value_usd != null ? Number(r.value_usd) : undefined,
+  valueEur: r.kind === "fiat" ? Number(r.amount) : undefined,
+  feeUsd: r.fee_usd != null ? Number(r.fee_usd) : undefined,
+  status: r.status, reason: r.reason || undefined, op: r.op_number || undefined,
+  hash: r.tx_hash || undefined, from: r.addr_from || undefined, to: r.addr_to || undefined,
+  toLabel: r.to_label || undefined, iban: r.iban || undefined, conf: r.conf || undefined,
+  date: r.created_at ? new Date(r.created_at).toLocaleDateString("es-ES", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : fecha(),
+});
+const txToRow = (uid, tx) => ({
+  user_id: uid, kind: tx.kind, type: tx.type, coin: tx.coin, sym: tx.sym,
+  amount: tx.amount, value_usd: tx.valueUsd ?? null, fee_usd: tx.feeUsd ?? null,
+  status: tx.status || "pendiente", reason: tx.reason ?? null, op_number: tx.op ?? null,
+  tx_hash: tx.hash ?? null, addr_from: tx.from ?? null, addr_to: tx.to ?? null,
+  to_label: tx.toLabel ?? null, iban: tx.iban ?? null, conf: tx.conf ?? null,
+});
+
+async function dbLoadTxs(token, uid) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/transactions?user_id=eq.${uid}&order=created_at.desc`, { headers: sbHeaders(token) });
+  const rows = await r.json();
+  return Array.isArray(rows) ? rows.map(rowToTx) : [];
+}
+async function dbInsertTx(token, uid, tx) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/transactions`, {
+    method: "POST", headers: { ...sbHeaders(token), Prefer: "return=representation" },
+    body: JSON.stringify([txToRow(uid, tx)]),
+  });
+  const rows = await r.json();
+  return Array.isArray(rows) && rows[0] ? rowToTx(rows[0]) : null;
+}
+async function dbUpdateTx(token, id, patch) {
+  const row = {};
+  if (patch.status) row.status = patch.status;
+  if ("reason" in patch) row.reason = patch.reason;
+  if (patch.hash) row.tx_hash = patch.hash;
+  if (patch.conf) row.conf = patch.conf;
+  if (patch.status === "confirmada" || patch.status === "denegada") row.resolved_at = new Date().toISOString();
+  await fetch(`${SUPABASE_URL}/rest/v1/transactions?id=eq.${id}`, {
+    method: "PATCH", headers: sbHeaders(token), body: JSON.stringify(row),
+  });
+}
+
 /* ------------------------- Tokens (tema único claro) ------------------------- */
 
 const T0 = {
@@ -592,6 +642,39 @@ export default function AmbarApp() {
     return () => clearTimeout(x);
   }, [toast]);
 
+  // Cargar movimientos guardados en Supabase al iniciar sesión un cliente.
+  // Reconstruye saldos desde el historial: así, entre desde donde entre, ve lo mismo.
+  const isSb = () => supabaseReady() && user?.token && user?.id;
+  useEffect(() => {
+    if (screen !== "app" || view !== "cliente" || !isSb()) return;
+    let cancel = false;
+    (async () => {
+      try {
+        const loaded = await dbLoadTxs(user.token, user.id);
+        if (cancel) return;
+        setTxs(loaded);
+        // Reconstruir saldos cripto y fiat desde el historial confirmado
+        setAssets((prev) => prev.map((a) => {
+          let amt = 0;
+          for (const t of loaded) {
+            if (t.coin !== a.id || t.kind !== "cripto") continue;
+            if (t.status === "confirmada") amt += t.type === "deposito" ? t.amount : -t.amount;
+            else if (t.status === "pendiente" && t.type === "retiro") amt -= t.amount; // retiro retenido
+          }
+          return { ...a, amount: Math.max(amt, 0) };
+        }));
+        let e = 0;
+        for (const t of loaded) {
+          if (t.kind !== "fiat") continue;
+          if (t.status === "confirmada") e += t.type === "deposito" ? t.amount : -t.amount;
+          else if (t.status === "pendiente" && t.type === "retiro") e -= t.amount;
+        }
+        setEur(Math.max(e, 0));
+      } catch (err) { /* silencioso: la app sigue en modo local */ }
+    })();
+    return () => { cancel = true; };
+  }, [screen, view, user?.id]);
+
   const cryptoUsd = assets.reduce((s, a) => s + a.price * a.amount, 0);
   const total = cryptoUsd + eur * EUR_USD;
 
@@ -677,15 +760,16 @@ export default function AmbarApp() {
     setToast(`Solicitud enviada (${coin.toUpperCase()}). Pendiente de emisión.`);
   };
 
-  const creditIncoming = (coin, amount) => {
+  const creditIncoming = async (coin, amount) => {
     const a = assets.find((x) => x.id === coin);
     const d = depositAddrs[coin];
-    setAssets((p) => p.map((x) => (x.id === coin ? { ...x, amount: x.amount + amount } : x)));
-    setTxs((p) => [{
-      id: ++nid.current, kind: "cripto", type: "deposito", coin, sym: a.sym, amount,
+    const base = { kind: "cripto", type: "deposito", coin, sym: a.sym, amount,
       valueUsd: amount * a.price, date: fecha(), status: "confirmada", op: opNum(),
-      hash: randHex(64), from: randAddr(chainOf(coin)), to: d?.addr, feeUsd: a.fee, conf: 40 + Math.floor(Math.random() * 500),
-    }, ...p]);
+      hash: randHex(64), from: randAddr(chainOf(coin)), to: d?.addr, feeUsd: a.fee, conf: 40 + Math.floor(Math.random() * 500) };
+    setAssets((p) => p.map((x) => (x.id === coin ? { ...x, amount: x.amount + amount } : x)));
+    let saved = null;
+    if (isSb()) { try { saved = await dbInsertTx(user.token, user.id, base); } catch (e) {} }
+    setTxs((p) => [saved || { ...base, id: ++nid.current }, ...p]);
     logEvent("Ingreso", `Depósito en cadena acreditado: ${fNum(amount)} ${a.sym}`);
     notify(`Detectamos y acreditamos tu depósito entrante de ${fNum(amount)} ${a.sym}.`);
     setToast(`Depósito acreditado: ${fNum(amount)} ${a.sym}`);
@@ -712,36 +796,39 @@ export default function AmbarApp() {
     setFiatReq(null); // los datos fiat se solicitan de nuevo en cada depósito
   };
 
-  const fiatDeposit = (amountEur, ref) => {
-    setTxs((p) => [{
-      id: ++nid.current, kind: "fiat", type: "deposito", coin: "eur", sym: "EUR", amount: amountEur,
-      valueEur: amountEur, date: fecha(), status: "pendiente", op: ref, iban: "Transferencia SEPA entrante",
-    }, ...p]);
+  const fiatDeposit = async (amountEur, ref) => {
+    const tx = { kind: "fiat", type: "deposito", coin: "eur", sym: "EUR", amount: amountEur,
+      valueEur: amountEur, date: fecha(), status: "pendiente", op: ref, iban: "Transferencia SEPA entrante" };
+    let saved = null;
+    if (isSb()) { try { saved = await dbInsertTx(user.token, user.id, tx); } catch (e) {} }
+    setTxs((p) => [saved || { ...tx, id: ++nid.current }, ...p]);
     logEvent("Ingreso", `Depósito fiat notificado: ${fEur(amountEur)} · ${ref}`);
     setToast("Depósito notificado. Pendiente de validación.");
     setSheet(null);
   };
 
-  const withdrawFiat = (amountEur, iban) => {
-    const tx = {
-      id: ++nid.current, kind: "fiat", type: "retiro", coin: "eur", sym: "EUR", amount: amountEur,
-      valueEur: amountEur, date: fecha(), status: "pendiente", op: opNum(), iban,
-    };
+  const withdrawFiat = async (amountEur, iban) => {
+    const base = { kind: "fiat", type: "retiro", coin: "eur", sym: "EUR", amount: amountEur,
+      valueEur: amountEur, date: fecha(), status: "pendiente", op: opNum(), iban };
     setEur((v) => v - amountEur);
+    let saved = null;
+    if (isSb()) { try { saved = await dbInsertTx(user.token, user.id, base); } catch (e) {} }
+    const tx = saved || { ...base, id: ++nid.current };
     setTxs((p) => [tx, ...p]);
     logEvent("Retiro", `Solicitud de retiro fiat: ${fEur(amountEur)} · ${tx.op}`);
     setSheet(null);
     setReceipt(tx);
   };
 
-  const withdrawCrypto = (coin, amount, entry) => {
+  const withdrawCrypto = async (coin, amount, entry) => {
     const a = assets.find((x) => x.id === coin);
-    const tx = {
-      id: ++nid.current, kind: "cripto", type: "retiro", coin, sym: a.sym, amount,
+    const base = { kind: "cripto", type: "retiro", coin, sym: a.sym, amount,
       valueUsd: amount * a.price, date: fecha(), status: "pendiente", op: opNum(),
-      to: entry.addr, toLabel: entry.label, feeUsd: a.fee,
-    };
+      to: entry.addr, toLabel: entry.label, feeUsd: a.fee };
     setAssets((p) => p.map((x) => (x.id === coin ? { ...x, amount: x.amount - amount } : x)));
+    let saved = null;
+    if (isSb()) { try { saved = await dbInsertTx(user.token, user.id, base); } catch (e) {} }
+    const tx = saved || { ...base, id: ++nid.current };
     setTxs((p) => [tx, ...p]);
     logEvent("Retiro", `Solicitud de retiro: ${fNum(amount)} ${a.sym} · ${tx.op}`);
     setSheet(null);
@@ -778,6 +865,7 @@ export default function AmbarApp() {
     const tx = txs.find((x) => x.id === id);
     setEur((v) => v + tx.amount);
     setTxs((p) => p.map((x) => (x.id === id ? { ...x, status: "confirmada" } : x)));
+    if (isSb()) dbUpdateTx(user.token, id, { status: "confirmada" }).catch(() => {});
     logEvent("Ingreso", `Gestor validó depósito ${tx.op} (${fEur(tx.amount)})`);
     notify(`Validamos tu transferencia de ${fEur(tx.amount)}. El saldo ya está disponible.`);
     setToast("Depósito validado");
@@ -785,7 +873,9 @@ export default function AmbarApp() {
 
   const gApproveWithdraw = (id) => {
     const tx = txs.find((x) => x.id === id);
-    setTxs((p) => p.map((x) => (x.id === id ? { ...x, status: "confirmada", ...(x.kind === "cripto" ? { hash: randHex(64), conf: 24 + Math.floor(Math.random() * 300) } : {}) } : x)));
+    const extra = tx.kind === "cripto" ? { hash: randHex(64), conf: 24 + Math.floor(Math.random() * 300) } : {};
+    setTxs((p) => p.map((x) => (x.id === id ? { ...x, status: "confirmada", ...extra } : x)));
+    if (isSb()) dbUpdateTx(user.token, id, { status: "confirmada", ...extra }).catch(() => {});
     logEvent("Retiro", `Gestor aprobó el retiro ${tx.op}`);
     notify(tx.kind === "fiat"
       ? `Tu retiro ${tx.op} de ${fEur(tx.amount)} fue aprobado y enviado a tu banco.`
@@ -798,6 +888,7 @@ export default function AmbarApp() {
     if (tx.kind === "fiat") setEur((v) => v + tx.amount);
     else setAssets((p) => p.map((x) => (x.id === tx.coin ? { ...x, amount: x.amount + tx.amount } : x)));
     setTxs((p) => p.map((x) => (x.id === id ? { ...x, status: "denegada", reason } : x)));
+    if (isSb()) dbUpdateTx(user.token, id, { status: "denegada", reason }).catch(() => {});
     logEvent("Retiro", `Gestor denegó el retiro ${tx.op}: ${reason}`);
     notify(`Tu retiro ${tx.op} fue denegado. Motivo: ${reason}. Los fondos fueron devueltos a tu saldo.`);
     setToast(`Retiro ${tx.op} denegado`);
@@ -806,6 +897,7 @@ export default function AmbarApp() {
   const gDenyFiatDeposit = (id, reason) => {
     const tx = txs.find((x) => x.id === id);
     setTxs((p) => p.map((x) => (x.id === id ? { ...x, status: "denegada", reason } : x)));
+    if (isSb()) dbUpdateTx(user.token, id, { status: "denegada", reason }).catch(() => {});
     logEvent("Ingreso", `Gestor rechazó el depósito ${tx.op}: ${reason}`);
     notify(`No pudimos validar tu depósito ${tx.op}. Motivo: ${reason}.`);
     setToast("Depósito rechazado");
