@@ -1162,6 +1162,8 @@ export default function AmbarApp() {
   const confirmFiatTransfer = () => {
     if (!fiatReq || fiatReq.status !== "emitida") return;
     fiatDeposit(fiatReq.amount, fiatReq.ref);
+    // Cerrar la solicitud en Supabase para que no reaparezca en el próximo refresco.
+    if (isSb() && user?.id && typeof fiatReq.id === "number") dbUpdateReq(user.token, fiatReq.id, { status: "resuelta" }).catch(() => {});
     setFiatReq(null); // los datos fiat se solicitan de nuevo en cada depósito
   };
 
