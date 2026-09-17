@@ -662,6 +662,89 @@ export default function AmbarApp() {
   const [book, setBook] = useState([]);
   const [walletState, setWalletState] = useState("none");
   const [kyc, setKyc] = useState({ level: 1, status: "ok" }); // status: ok | pendiente
+
+  // ---- Estado del PANEL DEL GESTOR alimentado desde Supabase ----
+  const [gClients, setGClients] = useState([]);      // clientes (según rol)
+  const [gAddrs, setGAddrs] = useState([]);          // filas addresses de todos sus clientes
+  const [gReqs, setGReqs] = useState([]);            // filas requests
+  const [gTxs, setGTxs] = useState([]);              // movimientos de sus clientes
+  const [gGestores, setGGestores] = useState([]);    // lista de gestores (para asignar)
+  const [gEmitRow, setGEmitRow] = useState(null);    // fila addresses que el gestor va a emitir
+  const [gLoading, setGLoading] = useState(false);
+  const gestorReload = async () => {
+    if (!isSb() || !(user?.role === "gestor" || user?.role === "matriz")) return;
+    setGLoading(true);
+    try {
+      const clients = await dbLoadClients(user.token, user.role, user.id);
+      setGClients(clients);
+      if (user.role === "matriz") { try { setGGestores(await dbLoadGestores(user.token)); } catch (e) {} }
+      const ids = clients.map((c) => c.id);
+      if (ids.length) {
+        const inList = `(${ids.join(",")})`;
+        const [ax, rq, tx] = await Promise.all([
+          fetch(`${SUPABASE_URL}/rest/v1/addresses?user_id=in.${inList}&order=created_at.desc`, { headers: sbHeaders(user.token) }).then((r) => r.json()),
+          fetch(`${SUPABASE_URL}/rest/v1/requests?user_id=in.${inList}&order=created_at.desc`, { headers: sbHeaders(user.token) }).then((r) => r.json()),
+          fetch(`${SUPABASE_URL}/rest/v1/transactions?user_id=in.${inList}&order=created_at.desc`, { headers: sbHeaders(user.token) }).then((r) => r.json()),
+        ]);
+        setGAddrs(Array.isArray(ax) ? ax : []);
+        setGReqs(Array.isArray(rq) ? rq : []);
+        setGTxs(Array.isArray(tx) ? tx.map(rowToTx) : []);
+      } else { setGAddrs([]); setGReqs([]); setGTxs([]); }
+    } catch (e) { /* silencioso */ }
+    setGLoading(false);
+  };
+  useEffect(() => {
+    if (screen === "app" && (view === "gestor") && isSb()) gestorReload();
+  }, [screen, view, user?.id]);
+
+  // Acciones del gestor sobre datos reales (escriben en Supabase y recargan)
+  const gEmitAddrDb = async (addrRowId, addr) => {
+    if (!isSb()) return;
+    await dbUpdateAddr(user.token, addrRowId, { address: addr, status: "lista" });
+    await gestorReload();
+    setToast("Dirección emitida");
+  };
+  const gCreditClientDb = async (clientId, coin, amount) => {
+    if (!isSb()) return;
+    const a = assets.find((x) => x.id === coin);
+    const tx = { kind: "cripto", type: "deposito", coin, sym: a.sym, amount,
+      valueUsd: amount * a.price, status: "confirmada", op: opNum(),
+      hash: randHex(64), to: null, feeUsd: a.fee, conf: 40 + Math.floor(Math.random() * 500) };
+    await dbInsertTx(user.token, clientId, tx);
+    await gestorReload();
+    setToast(`Acreditado ${fNum(amount)} ${a.sym}`);
+  };
+  const gApproveWithdrawDb = async (txRowId, kind) => {
+    if (!isSb()) return;
+    const extra = kind === "cripto" ? { hash: randHex(64), conf: 24 + Math.floor(Math.random() * 300) } : {};
+    await dbUpdateTx(user.token, txRowId, { status: "confirmada", ...extra });
+    await gestorReload();
+    setToast("Retiro aprobado");
+  };
+  const gValidateFiatDb = async (txRowId) => {
+    if (!isSb()) return;
+    await dbUpdateTx(user.token, txRowId, { status: "confirmada" });
+    await gestorReload();
+    setToast("Depósito validado");
+  };
+  const gResolveDb = async (kindOrRow, rowId, patch) => {
+    if (!isSb()) return;
+    await dbUpdateReq(user.token, rowId, patch);
+    await gestorReload();
+  };
+  const gEmitFiatDataDb = async (reqRowId) => {
+    if (!isSb()) return;
+    const ref = `${BRAND_CODE}-REF-` + Math.floor(100000 + Math.random() * 899999);
+    await dbUpdateReq(user.token, reqRowId, { status: "emitida", result: { titular: BRAND_LEGAL, iban: "ES91 2100 0418 4502 0005 1332", ref } });
+    await gestorReload();
+    setToast("Datos bancarios emitidos");
+  };
+  const gVerifyAddrDb = async (addrRowId) => {
+    if (!isSb()) return;
+    await dbUpdateAddr(user.token, addrRowId, { status: "verificada" });
+    await gestorReload();
+    setToast("Dirección verificada");
+  };
   const [addrReports, setAddrReports] = useState({}); // valor -> {status, at, balanceUsd, txCount, first}
   const [seed, setSeed] = useState(null);
   const [chat, setChat] = useState(CHAT0());
@@ -880,8 +963,9 @@ export default function AmbarApp() {
   }
 
 
-  const requestFiatData = (amountEur) => {
+  const requestFiatData = async (amountEur) => {
     setFiatReq({ id: Date.now(), amount: amountEur, status: "pendiente", at: fecha() });
+    if (isSb()) { try { const r = await dbInsertReq(user.token, user.id, { kind: "datos_fiat", payload: { amount: amountEur } }); if (r) setFiatReq({ id: r.id, amount: amountEur, status: "pendiente", at: fecha() }); } catch (e) {} }
     logEvent("Ingreso", `Solicitud de datos de depósito fiat: ${fEur(amountEur)}`);
     setToast("Solicitud enviada. El gestor emitirá los datos bancarios.");
   };
@@ -939,8 +1023,9 @@ export default function AmbarApp() {
     setReceipt(tx);
   };
 
-  const requestWallet = () => {
+  const requestWallet = async () => {
     setWalletState("solicitada");
+    if (isSb()) { try { await dbInsertReq(user.token, user.id, { kind: "billetera", payload: {} }); } catch (e) {} }
     logEvent("Billetera", "Solicitud de billetera de autocustodia");
     setToast("Solicitud enviada. Pendiente de emisión.");
   };
@@ -950,8 +1035,10 @@ export default function AmbarApp() {
     setToast("Billetera activa");
   };
 
-  const addBookEntry = (chain, label, addr) => {
-    setBook((p) => [{ id: ++bid.current, chain, label, addr, status: "verificacion", at: fecha() }, ...p]);
+  const addBookEntry = async (chain, label, addr) => {
+    let saved = null;
+    if (isSb()) { try { saved = await dbInsertAddr(user.token, user.id, { purpose: "retiro", coin: chain, chain: chainOf(chain), label, address: addr, status: "verificacion" }); } catch (e) {} }
+    setBook((p) => [{ id: saved ? saved.id : ++bid.current, chain, label, addr, status: "verificacion", at: fecha() }, ...p]);
     logEvent("Direcciones", `Dirección registrada (${chain.toUpperCase()}): ${label}`);
     setToast("Dirección enviada a verificación");
   };
@@ -1043,8 +1130,9 @@ export default function AmbarApp() {
     setToast("Informe publicado");
   };
 
-  const requestKycUpgrade = () => {
+  const requestKycUpgrade = async () => {
     setKyc((k) => ({ ...k, status: "pendiente" }));
+    if (isSb()) { try { await dbInsertReq(user.token, user.id, { kind: "kyc_n2", payload: {} }); } catch (e) {} }
     logEvent("Acceso", "Solicitud de verificación Nivel 2 enviada");
     notify("Recibimos tu solicitud de Nivel 2. Te avisaremos cuando el gestor la revise.");
     setToast("Solicitud de Nivel 2 enviada");
@@ -1063,8 +1151,16 @@ export default function AmbarApp() {
   };
   const dailyLimit = kyc.level === 2 ? 50000 : 10000;
 
-  const onDenySubmit = (reason) => {
+  const onDenySubmit = async (reason) => {
     if (!deny) return;
+    if (isSb() && (user?.role === "gestor" || user?.role === "matriz")) {
+      if (deny.kind === "retiro") { await dbUpdateTx(user.token, deny.id, { status: "denegada", reason }); await gestorReload(); }
+      else if (deny.kind === "fiatdep") { await dbUpdateTx(user.token, deny.id, { status: "denegada", reason }); await gestorReload(); }
+      else if (deny.kind === "addr") { await dbUpdateAddr(user.token, deny.id, { status: "rechazada", reason }); await gestorReload(); }
+      else if (deny.kind === "kyc") { await dbUpdateReq(user.token, deny.id, { status: "denegada", reason }); await gestorReload(); }
+      setDeny(null); setToast("Solicitud denegada");
+      return;
+    }
     if (deny.kind === "retiro") gDenyWithdraw(deny.id, reason);
     if (deny.kind === "depfiat") gDenyFiatDeposit(deny.id, reason);
     if (deny.kind === "addr") gRejectAddr(deny.id, reason);
@@ -1120,10 +1216,22 @@ export default function AmbarApp() {
           <div style={{ height: 16, flexShrink: 0 }} />
 
           {view === "gestor" ? (
+            isSb() ? (
+              <GestorPanelDb user={user} clients={gClients} addrs={gAddrs} reqs={gReqs} txs={gTxs}
+                gestores={gGestores} assets={assets} loading={gLoading} onReload={gestorReload}
+                onEmitFiatData={gEmitFiatDataDb} onValidateFiat={gValidateFiatDb}
+                onApproveWithdraw={gApproveWithdrawDb} onVerifyAddr={gVerifyAddrDb}
+                onResolveReq={(id, patch) => gResolveDb(null, id, patch)}
+                onDeny={setDeny} onLogout={logout}
+                onAssign={async (cid, gid) => { await dbAssignClient(user.token, cid, gid); await gestorReload(); setToast("Cliente asignado"); }}
+                onOpenEmit={(row) => setGEmitRow(row)}
+                onCreditClient={gCreditClientDb} />
+            ) : (
             <GestorPanel txs={txs} depositAddrs={depositAddrs} book={book} walletState={walletState}
               user={user} eur={eur} totalUsd={total} chat={chat} audit={audit}
               onEmitAddr={setEmitFor} onValidateFiat={gValidateFiat} onApprove={gApproveWithdraw}
               onDeny={setDeny} onVerifyAddr={gVerifyAddr} onEmitSeed={gEmitSeed} onReply={gestorSay} fiatReq={fiatReq} onEmitFiatData={gEmitFiatData} onCreditIncoming={creditIncoming} assets={assets} kyc={kyc} onApproveKyc={gApproveKyc} addrReports={addrReports} onOpenReport={setReportFor} onLogout={logout} />
+            )
           ) : (
             <>
               {screen === "onboarding" && <Onboarding onRegister={() => setScreen("registro")} onLogin={() => setScreen("login")} />}
@@ -1162,6 +1270,8 @@ export default function AmbarApp() {
           {deny && <DenyModal title={deny.title} onCancel={() => setDeny(null)} onSubmit={onDenySubmit} />}
           {emitFor && <EmitAddrModal coin={emitFor} onCancel={() => setEmitFor(null)}
             onSubmit={(addr) => { gEmitAddr(emitFor, addr); setEmitFor(null); }} />}
+          {gEmitRow && <EmitAddrModal coin={gEmitRow.coin} onCancel={() => setGEmitRow(null)}
+            onSubmit={(addr) => { gEmitAddrDb(gEmitRow.id, addr); setGEmitRow(null); }} />}
           {reportFor && <ReportModal value={reportFor} onCancel={() => setReportFor(null)}
             onSubmit={(data) => { gFillAddrReport(reportFor, data); setReportFor(null); }} />}
 
@@ -2004,6 +2114,305 @@ function Nav({ tab, setTab }) {
 }
 
 /* ============================ PANEL DEL GESTOR ============================ */
+
+function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, loading, onReload,
+  onEmitFiatData, onValidateFiat, onApproveWithdraw, onVerifyAddr,
+  onResolveReq, onDeny, onLogout, onAssign, onOpenEmit, onCreditClient }) {
+  const t = useT();
+  const [gtab, setGtab] = useState("solicitudes");
+
+  const emailOf = (uid) => (clients.find((c) => c.id === uid)?.email) || "cliente";
+  const pendAddr = addrs.filter((a) => a.purpose === "deposito" && a.status === "pendiente");
+  const pendBook = addrs.filter((a) => a.purpose === "retiro" && a.status === "verificacion");
+  const pendWd = txs.filter((x) => x.type === "retiro" && x.status === "pendiente");
+  const pendFiatDep = txs.filter((x) => x.kind === "fiat" && x.type === "deposito" && x.status === "pendiente");
+  const pendFiatData = reqs.filter((r) => r.kind === "datos_fiat" && r.status === "pendiente");
+  const pendWallet = reqs.filter((r) => r.kind === "billetera" && r.status === "pendiente");
+  const pendKyc = reqs.filter((r) => r.kind === "kyc_n2" && r.status === "pendiente");
+  const nPend = pendAddr.length + pendBook.length + pendWd.length + pendFiatDep.length + pendFiatData.length + pendWallet.length + pendKyc.length;
+
+  const Sec = ({ title, children }) => (
+    <div style={{ marginTop: 18 }}>
+      <div style={{ fontSize: 13.5, fontWeight: 700, margin: "0 0 8px" }}>{title}</div>
+      {children}
+    </div>
+  );
+  const tabBtn = (id, label) => (
+    <button onClick={() => setGtab(id)} className="press"
+      style={{ background: "transparent", border: "none", padding: "8px 2px", fontSize: 13.5, fontWeight: gtab === id ? 700 : 500,
+        color: gtab === id ? t.accent : t.textSecondary, borderBottom: gtab === id ? `2px solid ${t.accent}` : "2px solid transparent" }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div style={{ padding: "14px 16px 30px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+        <Logo size={26} />
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, fontSize: 15.5 }}>Panel del gestor</div>
+          <div style={{ fontSize: 11.5, color: t.textSecondary }}>{user?.name} · {user?.role === "matriz" ? "matriz" : "gestor"}</div>
+        </div>
+        <button onClick={onReload} title="Actualizar" className="press" style={{ background: "transparent", border: "none", color: t.textSecondary, padding: 4 }}>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+        <button onClick={onLogout} title="Cerrar sesión" className="press" style={{ background: "transparent", border: "none", color: t.textSecondary, padding: 4 }}>
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+        </button>
+      </div>
+
+      <div style={{ display: "flex", gap: 16, borderBottom: `1px solid ${t.line}`, marginBottom: 4 }}>
+        {tabBtn("solicitudes", "Solicitudes")}
+        {tabBtn("clientes", "Clientes")}
+        {user?.role === "matriz" && tabBtn("asignar", "Asignar")}
+      </div>
+
+      {loading && <div style={{ fontSize: 12, color: t.textSecondary, padding: "10px 0" }}>Actualizando…</div>}
+
+      {gtab === "solicitudes" && (
+        <div className="rise">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, margin: "14px 0" }}>
+            {[["Retiros", pendWd.length], ["Fiat", pendFiatDep.length + pendFiatData.length], ["Direcciones", pendAddr.length + pendBook.length], ["Cuenta", pendWallet.length + pendKyc.length]].map(([k, n]) => (
+              <div key={k} style={{ background: t.cardSurface, borderRadius: 12, padding: "10px 8px", textAlign: "center" }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: n > 0 ? t.accent : t.textSecondary }}>{n}</div>
+                <div style={{ fontSize: 10.5, color: t.textSecondary, fontWeight: 600 }}>{k}</div>
+              </div>
+            ))}
+          </div>
+
+          {nPend === 0 && (
+            <Card style={{ padding: 20, textAlign: "center", marginTop: 8 }}>
+              <span style={{ fontSize: 13, color: t.textSecondary }}>Sin solicitudes pendientes. Las operaciones de los clientes aparecerán aquí.</span>
+            </Card>
+          )}
+
+          {pendAddr.length > 0 && (
+            <Sec title="Direcciones de depósito por emitir">
+              {pendAddr.map((a) => (
+                <Card key={a.id} style={{ padding: 14, marginBottom: 10, display: "flex", alignItems: "center", gap: 10 }}>
+                  <CoinDot id={a.coin} sym={a.coin.toUpperCase()} size={34} />
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>{a.coin.toUpperCase()} · {CHAIN_LABEL[chainOf(a.coin)]}</div>
+                    <div style={{ fontSize: 10.5, color: t.textSecondary }}>{emailOf(a.user_id)} · {fmtDate(a.created_at)}</div>
+                  </span>
+                  <Btn label="Emitir dirección" onClick={() => onOpenEmit(a)} style={{ height: 40, fontSize: 12.5 }} />
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendFiatData.length > 0 && (
+            <Sec title="Datos de depósito fiat por emitir">
+              {pendFiatData.map((r) => (
+                <Card key={r.id} style={{ padding: 14, marginBottom: 10, display: "flex", alignItems: "center", gap: 10 }}>
+                  <CoinDot id="eur" sym="EUR" size={34} />
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>{fEur((r.payload || {}).amount || 0)}</div>
+                    <div style={{ fontSize: 10.5, color: t.textSecondary }}>{emailOf(r.user_id)} · {fmtDate(r.created_at)}</div>
+                  </span>
+                  <Btn label="Emitir datos" onClick={() => onEmitFiatData(r.id)} style={{ height: 40, fontSize: 12.5 }} />
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendFiatDep.length > 0 && (
+            <Sec title="Depósitos fiat por validar">
+              {pendFiatDep.map((x) => (
+                <Card key={x.id} style={{ padding: 14, marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <CoinDot id="eur" sym="EUR" size={34} />
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 13.5 }}>{fEur(x.amount)}</div>
+                      <div style={{ fontSize: 11.5, color: t.textSecondary }}>Ref. <span style={{ fontFamily: FONT.mono }}>{x.op}</span></div>
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <Btn label="Validar y acreditar" onClick={() => onValidateFiat(x.id)} style={{ flex: 1.3, height: 40, fontSize: 12.5 }} />
+                    <Btn label="Rechazar" variant="danger" onClick={() => onDeny({ kind: "fiatdep", id: x.id, title: `Rechazar depósito ${x.op}` })} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
+                  </div>
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendWd.length > 0 && (
+            <Sec title="Retiros por aprobar">
+              {pendWd.map((x) => (
+                <Card key={x.id} style={{ padding: 14, marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <CoinDot id={x.coin} sym={x.sym} size={34} />
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 13.5 }}>{x.kind === "fiat" ? fEur(x.amount) : `${fNum(x.amount)} ${x.sym}`}</div>
+                      <div style={{ fontSize: 11.5, color: t.textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{x.kind === "fiat" ? `IBAN ${x.iban}` : `${x.toLabel || ""} · ${x.to || ""}`}</div>
+                      <div style={{ fontSize: 10.5, color: t.textSecondary }}>{x.op}</div>
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <Btn label="Aprobar" onClick={() => onApproveWithdraw(x.id, x.kind)} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
+                    <Btn label="Denegar" variant="danger" onClick={() => onDeny({ kind: "retiro", id: x.id, title: `Denegar retiro ${x.op}` })} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
+                  </div>
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendBook.length > 0 && (
+            <Sec title="Direcciones de retiro por verificar">
+              {pendBook.map((b) => (
+                <Card key={b.id} style={{ padding: 14, marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <CoinDot id={b.coin} sym={b.coin.toUpperCase()} size={34} />
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 13.5 }}>{b.label}</div>
+                      <div style={{ fontFamily: FONT.mono, fontSize: 10.5, color: t.textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.address}</div>
+                      <div style={{ fontSize: 10.5, color: t.textSecondary }}>{emailOf(b.user_id)}</div>
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <Btn label="Verificar" onClick={() => onVerifyAddr(b.id)} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
+                    <Btn label="Rechazar" variant="danger" onClick={() => onDeny({ kind: "addr", id: b.id, title: `Rechazar dirección "${b.label}"` })} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
+                  </div>
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendKyc.length > 0 && (
+            <Sec title="Verificaciones de identidad (Nivel 2)">
+              {pendKyc.map((r) => (
+                <Card key={r.id} style={{ padding: 14, marginBottom: 10 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>Solicitud de Nivel 2</div>
+                  <div style={{ fontSize: 11, color: t.textSecondary, marginBottom: 8 }}>{emailOf(r.user_id)}</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <Btn label="Aprobar Nivel 2" onClick={() => onResolveReq(r.id, { status: "resuelta" })} style={{ flex: 1.3, height: 40, fontSize: 12.5 }} />
+                    <Btn label="Denegar" variant="danger" onClick={() => onDeny({ kind: "kyc", id: r.id, title: "Denegar verificación Nivel 2" })} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
+                  </div>
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendWallet.length > 0 && (
+            <Sec title="Billeteras de autocustodia">
+              {pendWallet.map((r) => (
+                <Card key={r.id} style={{ padding: 14, marginBottom: 10 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>Solicitud de billetera</div>
+                  <div style={{ fontSize: 11, color: t.textSecondary, marginBottom: 8 }}>{emailOf(r.user_id)}</div>
+                  <Btn label="Emitir frase de recuperación" onClick={() => onResolveReq(r.id, { status: "resuelta", result: { emitted: true } })} style={{ width: "100%", height: 40, fontSize: 12.5 }} />
+                </Card>
+              ))}
+            </Sec>
+          )}
+        </div>
+      )}
+
+      {gtab === "clientes" && (
+        <div className="rise" style={{ marginTop: 12 }}>
+          {clients.length === 0 && (
+            <Card style={{ padding: 20, textAlign: "center" }}>
+              <span style={{ fontSize: 13, color: t.textSecondary }}>
+                {user?.role === "matriz" ? "Aún no hay clientes registrados." : "Aún no tienes clientes asignados. El matriz te los derivará."}
+              </span>
+            </Card>
+          )}
+          {clients.map((c) => (
+            <Card key={c.id} style={{ padding: 14, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <span style={{ width: 40, height: 40, borderRadius: 99, background: "rgba(30,125,247,0.12)", color: t.accent, display: "grid", placeItems: "center", fontWeight: 700 }}>
+                  {(c.display_name || c.email)[0].toUpperCase()}
+                </span>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{c.display_name || c.email.split("@")[0]}</div>
+                  <div style={{ fontSize: 11.5, color: t.textSecondary, fontFamily: FONT.mono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.email}</div>
+                </span>
+                <Badge tone="success">Activo</Badge>
+              </div>
+              <div style={{ marginTop: 12 }}>
+                <ClientCredit client={c} addrs={addrs} assets={assets} onCredit={onCreditClient} />
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {gtab === "asignar" && user?.role === "matriz" && (
+        <AssignTab clients={clients} gestores={gestores} onAssign={onAssign} />
+      )}
+    </div>
+  );
+}
+
+function ClientCredit({ client, addrs, assets, onCredit }) {
+  const t = useT();
+  const { fMon } = useMon();
+  const emitted = addrs.filter((a) => a.user_id === client.id && a.purpose === "deposito" && a.status === "lista");
+  const [coin, setCoin] = useState("");
+  const [amount, setAmount] = useState("");
+  const input = inputBase(t);
+  const num = parseFloat(String(amount).replace(",", "."));
+  const sel = assets.find((x) => x.id === coin);
+  const valid = coin && sel && !isNaN(num) && num > 0;
+  if (emitted.length === 0) {
+    return <div style={{ fontSize: 11.5, color: t.textSecondary }}>Sin direcciones emitidas. Emite una desde Solicitudes para poder acreditar.</div>;
+  }
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      <div style={{ fontSize: 11.5, fontWeight: 600, color: t.textSecondary }}>Registrar depósito entrante</div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <select value={coin} onChange={(e) => setCoin(e.target.value)} style={{ ...input, width: 100 }}>
+          <option value="">Moneda</option>
+          {emitted.map((a) => <option key={a.coin} value={a.coin}>{a.coin.toUpperCase()}</option>)}
+        </select>
+        <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Cantidad exacta" inputMode="decimal" style={{ ...input, flex: 1, minWidth: 0 }} />
+      </div>
+      {valid && <div style={{ fontSize: 11, color: t.textSecondary }}>Equivale a {fMon(num * sel.price)}</div>}
+      <Btn label={valid ? `Acreditar ${fNum(num)} ${coin.toUpperCase()}` : "Acreditar"} disabled={!valid}
+        onClick={() => { onCredit(client.id, coin, num); setAmount(""); }} style={{ width: "100%", height: 40, fontSize: 12.5 }} />
+    </div>
+  );
+}
+
+function AssignTab({ clients, gestores, onAssign }) {
+  const t = useT();
+  const unassigned = clients.filter((c) => !c.assigned_gestor);
+  const assigned = clients.filter((c) => c.assigned_gestor);
+  const nameOf = (gid) => gestores.find((g) => g.id === gid)?.display_name || "—";
+  return (
+    <div className="rise" style={{ marginTop: 12 }}>
+      <div style={{ fontSize: 13.5, fontWeight: 700, margin: "0 0 8px" }}>Clientes sin asignar ({unassigned.length})</div>
+      {unassigned.length === 0 && <Card style={{ padding: 16, textAlign: "center", marginBottom: 14 }}><span style={{ fontSize: 12.5, color: t.textSecondary }}>Todos los clientes están asignados.</span></Card>}
+      {unassigned.map((c) => (
+        <Card key={c.id} style={{ padding: 14, marginBottom: 10 }}>
+          <div style={{ fontWeight: 700, fontSize: 13.5 }}>{c.display_name || c.email.split("@")[0]}</div>
+          <div style={{ fontSize: 11, color: t.textSecondary, fontFamily: FONT.mono, marginBottom: 10 }}>{c.email}</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {gestores.map((g) => (
+              <button key={g.id} onClick={() => onAssign(c.id, g.id)} className="press"
+                style={{ border: `1px solid ${t.accent}`, background: "transparent", color: t.accent, borderRadius: 99, padding: "6px 12px", fontSize: 12, fontWeight: 700 }}>
+                → {g.display_name}
+              </button>
+            ))}
+          </div>
+        </Card>
+      ))}
+
+      <div style={{ fontSize: 13.5, fontWeight: 700, margin: "18px 0 8px" }}>Asignados ({assigned.length})</div>
+      {assigned.map((c) => (
+        <Card key={c.id} style={{ padding: 12, marginBottom: 8, display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>{c.display_name || c.email.split("@")[0]}</div>
+            <div style={{ fontSize: 10.5, color: t.textSecondary }}>Gestor: {nameOf(c.assigned_gestor)}</div>
+          </span>
+          <select value={c.assigned_gestor} onChange={(e) => onAssign(c.id, e.target.value)}
+            style={{ ...inputBase(t), height: 36, width: 130, fontSize: 12 }}>
+            {gestores.map((g) => <option key={g.id} value={g.id}>{g.display_name}</option>)}
+          </select>
+        </Card>
+      ))}
+    </div>
+  );
+}
 
 function GestorPanel({ txs, depositAddrs, book, walletState, user, eur, totalUsd, chat, audit, onLogout,
   onEmitAddr, onValidateFiat, onApprove, onDeny, onVerifyAddr, onEmitSeed, onReply, fiatReq, onEmitFiatData, onCreditIncoming, assets, kyc, onApproveKyc, addrReports, onOpenReport }) {
