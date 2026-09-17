@@ -261,7 +261,7 @@ const ASSETS0 = [
   { id: "sol", name: "Solana", sym: "SOL", price: 142.6, amount: 0, vol: 0.024, eco: "otro", block: 316420877, min: 1, fee: 0.002 },
   { id: "ltc", name: "Litecoin", sym: "LTC", price: 91.4, amount: 0, vol: 0.02, eco: "bitcoin", block: 2870341, min: 4, fee: 0.01 },
   { id: "xmr", name: "Monero", sym: "XMR", price: 168.2, amount: 0, vol: 0.02, eco: "privacidad", block: 3327904, min: 3, fee: 0.03 },
-  { id: "usdt", name: "Tether", sym: "USDT", network: "eth", price: 1, amount: 0, vol: 0.0006, eco: "ethereum", block: 21894412, min: 1, fee: 0.41 },
+  { id: "usdt", name: "Tether", sym: "USDT", network: "trx", price: 1, amount: 0, vol: 0.0006, eco: "tron", block: 68240100, min: 1, fee: 1.0 },
   { id: "usdc", name: "USD Coin", sym: "USDC", network: "eth", price: 1, amount: 0, vol: 0.0006, eco: "ethereum", block: 21894412, min: 1, fee: 0.41 },
 ];
 
@@ -273,8 +273,8 @@ const MOVERS0 = [
 ];
 
 const DEPOSIT_COINS = ["btc", "eth", "usdt", "usdc", "sol"];
-const chainOf = (c) => (c === "btc" ? "btc" : c === "sol" ? "sol" : "eth");
-const CHAIN_LABEL = { btc: "Bitcoin", eth: "Ethereum (ERC-20)", sol: "Solana" };
+const chainOf = (c) => (c === "btc" ? "btc" : c === "sol" ? "sol" : c === "usdt" || c === "trx" ? "trx" : "eth");
+const CHAIN_LABEL = { btc: "Bitcoin", eth: "Ethereum (ERC-20)", trx: "Tron (TRC-20)", sol: "Solana" };
 
 const fNum2 = (n, min, max) => new Intl.NumberFormat("es-ES", { minimumFractionDigits: min, maximumFractionDigits: max }).format(n);
 const fUsd = (n) => {
@@ -297,7 +297,9 @@ async function sha256Hex(text) {
 }
 
 const randHex = (n) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
-const randAddr = (chain) => (chain === "btc" ? "bc1q" + randHex(32) : chain === "sol" ? randHex(4).toUpperCase() + randHex(36) : "0x" + randHex(40));
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const randB58 = (n) => Array.from({ length: n }, () => B58[Math.floor(Math.random() * B58.length)]).join("");
+const randAddr = (chain) => (chain === "btc" ? "bc1q" + randHex(32) : chain === "sol" ? randB58(43) : chain === "trx" ? "T" + randB58(33) : "0x" + randHex(40));
 const opNum = () => `${BRAND_CODE}-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 89999)}`;
 const hhmm = () => new Date().toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
 const fecha = () => new Date().toLocaleString("es-ES", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).replace(".", "");
@@ -679,6 +681,29 @@ export default function AmbarApp() {
   const [view, setView] = useState("cliente"); // cliente | gestor
   const [screen, setScreen] = useState("onboarding"); // onboarding | login | registro | pin | app
   const [user, setUser] = useState(null);
+
+  // Restaurar sesión guardada al recargar (evita que F5 cierre la sesión).
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("ambar_session");
+      if (raw) {
+        const s = JSON.parse(raw);
+        if (s && s.user && s.user.token) {
+          setUser(s.user);
+          setView(s.view || "cliente");
+          setScreen("app");
+        }
+      }
+    } catch (e) {}
+  }, []);
+  // Guardar / limpiar la sesión cuando cambia el usuario.
+  useEffect(() => {
+    try {
+      if (user && user.token && screen === "app") {
+        localStorage.setItem("ambar_session", JSON.stringify({ user, view }));
+      }
+    } catch (e) {}
+  }, [user, view, screen]);
   const [tab, setTab] = useState("inicio");
 
   const [assets, setAssets] = useState(ASSETS0);
@@ -703,6 +728,9 @@ export default function AmbarApp() {
   const [gEmitRow, setGEmitRow] = useState(null);    // fila addresses que el gestor va a emitir
   const [gChatClient, setGChatClient] = useState(null); // cliente cuyo chat abre el gestor
   const [gChatMsgs, setGChatMsgs] = useState([]);
+  const [gMsgs, setGMsgs] = useState([]); // últimos mensajes de clientes (para el aviso)
+  const [gMsgsSeen, setGMsgsSeen] = useState(0); // id máximo visto
+  const [gReportRow, setGReportRow] = useState(null); // solicitud de informe a rellenar
   const gOpenChat = async (client) => {
     setGChatClient(client);
     if (isSb()) { try { setGChatMsgs(await dbLoadMsgs(user.token, client.id)); } catch (e) { setGChatMsgs([]); } }
@@ -731,12 +759,23 @@ export default function AmbarApp() {
         setGAddrs(Array.isArray(ax) ? ax : []);
         setGReqs(Array.isArray(rq) ? rq : []);
         setGTxs(Array.isArray(tx) ? tx.map(rowToTx) : []);
+        // Mensajes de clientes (para avisar de nuevos en Soporte)
+        try {
+          const mm = await fetch(`${SUPABASE_URL}/rest/v1/messages?user_id=in.${inList}&sender=eq.cliente&order=created_at.desc`, { headers: sbHeaders(user.token) }).then((r) => r.json());
+          setGMsgs(Array.isArray(mm) ? mm : []);
+        } catch (e) {}
       } else { setGAddrs([]); setGReqs([]); setGTxs([]); }
     } catch (e) { /* silencioso */ }
     setGLoading(false);
   };
   useEffect(() => {
     if (screen === "app" && (view === "gestor") && isSb()) gestorReload();
+  }, [screen, view, user?.id]);
+  // Refresco en vivo del panel del gestor
+  useEffect(() => {
+    if (screen !== "app" || view !== "gestor" || !isSb()) return;
+    const iv = setInterval(() => { gestorReload(); }, 6000);
+    return () => clearInterval(iv);
   }, [screen, view, user?.id]);
 
   // Acciones del gestor sobre datos reales (escriben en Supabase y recargan)
@@ -790,9 +829,19 @@ export default function AmbarApp() {
   };
   const gVerifyAddrDb = async (addrRowId) => {
     if (!isSb()) return;
+    const vrow = gAddrs.find((a) => a.id === addrRowId);
     await dbUpdateAddr(user.token, addrRowId, { status: "verificada" });
+    if (vrow) await dbInsertNoti(user.token, vrow.user_id, `Verificamos tu dirección "${vrow.label}". Ya puedes usarla para retirar.`).catch(() => {});
     await gestorReload();
     setToast("Dirección verificada");
+  };
+  const gFillReportDb = async (reqRowId, data) => {
+    if (!isSb()) return;
+    const rrow = gReqs.find((r) => r.id === reqRowId);
+    await dbUpdateReq(user.token, reqRowId, { status: "resuelta", result: data });
+    if (rrow) await dbInsertNoti(user.token, rrow.user_id, "El informe de la dirección que consultaste ya está disponible en Explorar.").catch(() => {});
+    await gestorReload();
+    setToast("Informe publicado");
   };
   const [addrReports, setAddrReports] = useState({}); // valor -> {status, at, balanceUsd, txCount, first}
   const [seed, setSeed] = useState(null);
@@ -907,6 +956,16 @@ export default function AmbarApp() {
         if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
         const kycReq = reqs.find((q) => q.kind === "kyc_n2");
         if (kycReq) setKyc({ level: kycReq.status === "resuelta" ? 2 : 1, status: kycReq.status === "pendiente" || kycReq.status === "emitida" ? "pendiente" : "ok" });
+        // Informes de dirección (explorador)
+        const reps = {};
+        for (const q of reqs) {
+          if (q.kind !== "informe_direccion") continue;
+          const addr = (q.payload || {}).address;
+          if (!addr) continue;
+          if (q.status === "resuelta" && q.result) reps[addr] = { status: "lista", at: fmtDate(q.created_at), ...q.result };
+          else reps[addr] = { status: "pendiente", at: fmtDate(q.created_at) };
+        }
+        setAddrReports(reps);
 
         // Chat de soporte y notificaciones
         const msgs = await dbLoadMsgs(user.token, user.id);
@@ -927,10 +986,12 @@ export default function AmbarApp() {
     if (screen !== "app" || view !== "cliente" || !isSb()) return;
     const iv = setInterval(async () => {
       try {
-        const [loaded, nt, msgs] = await Promise.all([
+        const [loaded, nt, msgs, addrs, reqs] = await Promise.all([
           dbLoadTxs(user.token, user.id),
           dbLoadNotis(user.token, user.id),
           dbLoadMsgs(user.token, user.id),
+          dbLoadAddrs(user.token, user.id),
+          dbLoadReqs(user.token, user.id),
         ]);
         setTxs(loaded);
         setAssets((prev) => prev.map((a) => {
@@ -952,8 +1013,30 @@ export default function AmbarApp() {
         setNotis(nt.map((n) => ({ id: n.id, text: n.body, at: fmtTime(n.created_at) })));
         setNotisUnread(nt.filter((n) => !n.read).length);
         if (msgs.length) setChat(msgs.map((m) => ({ id: m.id, from: m.sender === "gestor" ? "gestor" : "yo", text: m.body, at: fmtTime(m.created_at) })));
+        // Direcciones: refleja en vivo cuando el gestor emite
+        const dep = {};
+        const wl = [];
+        for (const a of addrs) {
+          if (a.purpose === "deposito") dep[a.coin] = { status: a.status === "lista" ? "lista" : "pendiente", addr: a.address || undefined, at: fmtDate(a.created_at), _id: a.id };
+          else wl.push({ id: a.id, chain: a.coin, label: a.label, addr: a.address, status: a.status === "verificada" ? "verificada" : a.status === "rechazada" ? "rechazada" : "verificacion", reason: a.reason || undefined, at: fmtDate(a.created_at) });
+        }
+        setDepositAddrs(dep);
+        setBook(wl);
+        const fiatPend = reqs.find((q) => q.kind === "datos_fiat" && q.status !== "resuelta" && q.status !== "denegada");
+        if (fiatPend) { const rr = fiatPend.result || {}; setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", titular: rr.titular, iban: rr.iban, ref: rr.ref, at: fmtDate(fiatPend.created_at) }); }
+        const wallet = reqs.find((q) => q.kind === "billetera");
+        if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
+        const reps = {};
+        for (const q of reqs) {
+          if (q.kind !== "informe_direccion") continue;
+          const addr = (q.payload || {}).address;
+          if (!addr) continue;
+          if (q.status === "resuelta" && q.result) reps[addr] = { status: "lista", at: fmtDate(q.created_at), ...q.result };
+          else reps[addr] = { status: "pendiente", at: fmtDate(q.created_at) };
+        }
+        setAddrReports(reps);
       } catch (e) { /* silencioso */ }
-    }, 8000);
+    }, 5000);
     return () => clearInterval(iv);
   }, [screen, view, user?.id]);
 
@@ -1214,8 +1297,9 @@ export default function AmbarApp() {
     setToast("Frase de recuperación emitida");
   };
 
-  const requestAddrReport = (value) => {
+  const requestAddrReport = async (value) => {
     setAddrReports((p) => ({ ...p, [value]: { status: "pendiente", at: fecha() } }));
+    if (isSb() && user?.id) { try { await dbInsertReq(user.token, user.id, { kind: "informe_direccion", payload: { address: value } }); } catch (e) {} }
     logEvent("Explorador", `Informe de dirección solicitado: ${value.slice(0, 18)}…`);
     setToast("Solicitud enviada al equipo de operaciones");
   };
@@ -1266,6 +1350,7 @@ export default function AmbarApp() {
 
   const logout = () => {
     logEvent("Acceso", "Sesión cerrada");
+    try { localStorage.removeItem("ambar_session"); } catch (e) {}
     setUser(null); setView("cliente"); setScreen("onboarding"); setTab("inicio");
     setToast("Sesión cerrada");
   };
@@ -1322,7 +1407,9 @@ export default function AmbarApp() {
                 onAssign={async (cid, gid) => { await dbAssignClient(user.token, cid, gid); await gestorReload(); setToast("Cliente asignado"); }}
                 onOpenEmit={(row) => setGEmitRow(row)}
                 onCreditClient={gCreditClientDb}
-                chatClient={gChatClient} chatMsgs={gChatMsgs} onOpenChat={gOpenChat} onSendChat={gSendChat} onCloseChat={() => setGChatClient(null)} />
+                onOpenReport={(r) => setGReportRow(r)}
+                chatClient={gChatClient} chatMsgs={gChatMsgs} onOpenChat={(c) => { gOpenChat(c); const mx = Math.max(0, ...gMsgs.map((m) => m.id)); setGMsgsSeen(mx); }} onSendChat={gSendChat} onCloseChat={() => setGChatClient(null)}
+                newMsgs={gMsgs.filter((m) => m.id > gMsgsSeen).length} />
             ) : (
             <GestorPanel txs={txs} depositAddrs={depositAddrs} book={book} walletState={walletState}
               user={user} eur={eur} totalUsd={total} chat={chat} audit={audit}
@@ -1369,6 +1456,8 @@ export default function AmbarApp() {
             onSubmit={(addr) => { gEmitAddr(emitFor, addr); setEmitFor(null); }} />}
           {gEmitRow && <EmitAddrModal coin={gEmitRow.coin} onCancel={() => setGEmitRow(null)}
             onSubmit={(addr) => { gEmitAddrDb(gEmitRow.id, addr); setGEmitRow(null); }} />}
+          {gReportRow && <ReportModal value={(gReportRow.payload || {}).address} onCancel={() => setGReportRow(null)}
+            onSubmit={(data) => { gFillReportDb(gReportRow.id, data); setGReportRow(null); }} />}
           {reportFor && <ReportModal value={reportFor} onCancel={() => setReportFor(null)}
             onSubmit={(data) => { gFillAddrReport(reportFor, data); setReportFor(null); }} />}
 
@@ -2215,7 +2304,7 @@ function Nav({ tab, setTab }) {
 function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, loading, onReload,
   onEmitFiatData, onValidateFiat, onApproveWithdraw, onVerifyAddr,
   onResolveReq, onDeny, onLogout, onAssign, onOpenEmit, onCreditClient,
-  chatClient, chatMsgs, onOpenChat, onSendChat, onCloseChat }) {
+  chatClient, chatMsgs, onOpenChat, onSendChat, onCloseChat, newMsgs = 0, onOpenReport }) {
   const t = useT();
   const [gtab, setGtab] = useState("solicitudes");
 
@@ -2227,7 +2316,8 @@ function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, load
   const pendFiatData = reqs.filter((r) => r.kind === "datos_fiat" && r.status === "pendiente");
   const pendWallet = reqs.filter((r) => r.kind === "billetera" && r.status === "pendiente");
   const pendKyc = reqs.filter((r) => r.kind === "kyc_n2" && r.status === "pendiente");
-  const nPend = pendAddr.length + pendBook.length + pendWd.length + pendFiatDep.length + pendFiatData.length + pendWallet.length + pendKyc.length;
+  const pendReports = reqs.filter((r) => r.kind === "informe_direccion" && r.status === "pendiente");
+  const nPend = pendAddr.length + pendBook.length + pendWd.length + pendFiatDep.length + pendFiatData.length + pendWallet.length + pendKyc.length + pendReports.length;
 
   const Sec = ({ title, children }) => (
     <div style={{ marginTop: 18 }}>
@@ -2262,7 +2352,10 @@ function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, load
       <div style={{ display: "flex", gap: 16, borderBottom: `1px solid ${t.line}`, marginBottom: 4 }}>
         {tabBtn("solicitudes", "Solicitudes")}
         {tabBtn("clientes", "Clientes")}
-        {tabBtn("soporte", "Soporte")}
+        <span style={{ position: "relative", display: "inline-flex" }}>
+          {tabBtn("soporte", "Soporte")}
+          {newMsgs > 0 && <span style={{ position: "absolute", top: 3, right: -8, minWidth: 16, height: 16, borderRadius: 99, background: t.error, color: "#fff", fontSize: 10, fontWeight: 700, display: "grid", placeItems: "center", padding: "0 4px" }}>{newMsgs}</span>}
+        </span>
         {user?.role === "matriz" && tabBtn("asignar", "Asignar")}
       </div>
 
@@ -2387,6 +2480,19 @@ function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, load
                     <Btn label="Aprobar Nivel 2" onClick={() => onResolveReq(r.id, { status: "resuelta" })} style={{ flex: 1.3, height: 40, fontSize: 12.5 }} />
                     <Btn label="Denegar" variant="danger" onClick={() => onDeny({ kind: "kyc", id: r.id, title: "Denegar verificación Nivel 2" })} style={{ flex: 1, height: 40, fontSize: 12.5 }} />
                   </div>
+                </Card>
+              ))}
+            </Sec>
+          )}
+
+          {pendReports.length > 0 && (
+            <Sec title="Informes de dirección solicitados">
+              {pendReports.map((r) => (
+                <Card key={r.id} style={{ padding: 14, marginBottom: 10 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>Consulta de dirección</div>
+                  <div style={{ fontFamily: FONT.mono, fontSize: 10.5, color: t.textSecondary, wordBreak: "break-all", margin: "2px 0 4px" }}>{(r.payload || {}).address}</div>
+                  <div style={{ fontSize: 10.5, color: t.textSecondary, marginBottom: 8 }}>{emailOf(r.user_id)} · {fmtDate(r.created_at)}</div>
+                  <Btn label="Completar informe" onClick={() => onOpenReport(r)} style={{ width: "100%", height: 40, fontSize: 12.5 }} />
                 </Card>
               ))}
             </Sec>
@@ -2987,6 +3093,7 @@ const ADDR_RULES = {
   btc: { re: /^(bc1[0-9a-z]{24,60}|[13][a-km-zA-HJ-NP-Z1-9]{24,40})$/, hint: "bc1… o 1…/3… (Bitcoin)" },
   eth: { re: /^0x[0-9a-fA-F]{40}$/, hint: "0x seguido de 40 caracteres hexadecimales" },
   sol: { re: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, hint: "32–44 caracteres base58 (Solana)" },
+  trx: { re: /^T[1-9A-HJ-NP-Za-km-z]{33}$/, hint: "empieza por T y 34 caracteres (Tron TRC-20)" },
 };
 
 function EmitAddrModal({ coin, onCancel, onSubmit }) {
