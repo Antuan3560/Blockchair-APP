@@ -1,5 +1,5 @@
 export const metadata = {
-  title: "ámbar · billetera y explorador",
+  title: "Blockchair",
   description: "Billetera y explorador de blockchain en una sola app.",
 };
 
