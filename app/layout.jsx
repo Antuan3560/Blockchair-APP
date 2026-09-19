@@ -1,5 +1,5 @@
 export const metadata = {
-  title: "Blockchair",
+  title: "ámbar · billetera y explorador",
   description: "Billetera y explorador de blockchain en una sola app.",
 };
 
@@ -7,6 +7,7 @@ export const viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
+  viewportFit: "cover",
   themeColor: "#FFFFFF",
 };
 
