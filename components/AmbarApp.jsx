@@ -11,9 +11,9 @@ import React, { useState, useEffect, useMemo, useRef, createContext, useContext 
    su panel, con motivo obligatorio al denegar retiros.
    ============================================================ */
 
-const BRAND = "Blockchair";                 // nombre visible de la app
-const BRAND_LEGAL = "Blockchair Custodia SL"; // titular de la cuenta de depósitos
-const BRAND_CODE = "BKCH";                // prefijo de referencias y operaciones
+const BRAND = "ámbar";                 // nombre visible de la app
+const BRAND_LEGAL = "Ámbar Custodia SL"; // titular de la cuenta de depósitos
+const BRAND_CODE = "AMB";                // prefijo de referencias y operaciones
 
 // Cuenta con acceso al panel del gestor. En el proyecto real esto lo
 // decide la columna role de la tabla profiles en Supabase; aquí basta
@@ -159,6 +159,13 @@ async function dbInsertReq(token, uid, q) {
   });
   const rows = await r.json();
   return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+// Cierra solicitudes de datos fiat anteriores (pendiente/emitida) del cliente,
+// para que no se acumulen intentos abandonados. No toca depósitos (transactions).
+async function dbCloseOpenFiatReqs(token, uid) {
+  await fetch(`${SUPABASE_URL}/rest/v1/requests?user_id=eq.${uid}&kind=eq.datos_fiat&status=in.(pendiente,emitida)`, {
+    method: "PATCH", headers: sbHeaders(token), body: JSON.stringify({ status: "resuelta" }),
+  });
 }
 async function dbUpdateReq(token, id, patch) {
   const row = { ...patch };
@@ -732,6 +739,15 @@ export default function AmbarApp() {
   const [gMsgsSeen, setGMsgsSeen] = useState(0); // id máximo visto
   const [gReportRow, setGReportRow] = useState(null); // solicitud de informe a rellenar
   const [gFiatRow, setGFiatRow] = useState(null); // solicitud de datos fiat a emitir
+  const [gSeedRow, setGSeedRow] = useState(null); // solicitud de billetera para emitir seed
+  const gEmitSeedDb = async (reqRowId, words) => {
+    if (!isSb()) return;
+    const row = gReqs.find((r) => r.id === reqRowId);
+    await dbUpdateReq(user.token, reqRowId, { status: "emitida", result: { seed: words } });
+    if (row) await dbInsertNoti(user.token, row.user_id, "Tu frase de recuperación está lista en Billetera. Anótala y guárdala fuera de línea.").catch(() => {});
+    await gestorReload();
+    setToast("Frase de recuperación emitida");
+  };
   const gOpenChat = async (client) => {
     setGChatClient(client);
     if (isSb()) { try { setGChatMsgs(await dbLoadMsgs(user.token, client.id)); } catch (e) { setGChatMsgs([]); } }
@@ -791,9 +807,11 @@ export default function AmbarApp() {
   const gCreditClientDb = async (clientId, coin, amount) => {
     if (!isSb()) return;
     const a = assets.find((x) => x.id === coin);
+    // Buscar la dirección de depósito emitida de ese cliente para esta moneda
+    const depAddr = gAddrs.find((ad) => ad.user_id === clientId && ad.purpose === "deposito" && ad.coin === coin && ad.status === "lista");
     const tx = { kind: "cripto", type: "deposito", coin, sym: a.sym, amount,
       valueUsd: amount * a.price, status: "confirmada", op: opNum(),
-      hash: randHex(64), to: null, feeUsd: a.fee, conf: 40 + Math.floor(Math.random() * 500) };
+      hash: randHex(64), to: depAddr ? depAddr.address : null, feeUsd: a.fee, conf: 40 + Math.floor(Math.random() * 500) };
     await dbInsertTx(user.token, clientId, tx);
     await dbInsertNoti(user.token, clientId, `Detectamos y acreditamos tu depósito entrante de ${fNum(amount)} ${a.sym}.`).catch(() => {});
     await gestorReload();
@@ -955,7 +973,10 @@ export default function AmbarApp() {
           setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", beneficiario: r.beneficiario, titular: r.titular, iban: r.iban, bic: r.bic, ref: r.ref, at: fmtDate(fiatPend.created_at) });
         }
         const wallet = reqs.find((q) => q.kind === "billetera");
-        if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
+        if (wallet) {
+          setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "seed" : "solicitada");
+          if (wallet.result && wallet.result.seed) setSeed(wallet.result.seed);
+        }
         const kycReq = reqs.find((q) => q.kind === "kyc_n2");
         if (kycReq) setKyc({ level: kycReq.status === "resuelta" ? 2 : 1, status: kycReq.status === "pendiente" || kycReq.status === "emitida" ? "pendiente" : "ok" });
         // Informes de dirección (explorador)
@@ -1027,7 +1048,10 @@ export default function AmbarApp() {
         const fiatPend = reqs.find((q) => q.kind === "datos_fiat" && q.status !== "resuelta" && q.status !== "denegada");
         if (fiatPend) { const rr = fiatPend.result || {}; setFiatReq({ id: fiatPend.id, amount: (fiatPend.payload || {}).amount, status: fiatPend.status === "emitida" ? "emitida" : "pendiente", beneficiario: rr.beneficiario, titular: rr.titular, iban: rr.iban, bic: rr.bic, ref: rr.ref, at: fmtDate(fiatPend.created_at) }); }
         const wallet = reqs.find((q) => q.kind === "billetera");
-        if (wallet) setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "emitida" : "solicitada");
+        if (wallet) {
+          setWalletState(wallet.status === "resuelta" ? "activa" : wallet.status === "emitida" ? "seed" : "solicitada");
+          if (wallet.result && wallet.result.seed) setSeed(wallet.result.seed);
+        }
         const reps = {};
         for (const q of reqs) {
           if (q.kind !== "informe_direccion") continue;
@@ -1146,7 +1170,13 @@ export default function AmbarApp() {
 
   const requestFiatData = async (amountEur) => {
     setFiatReq({ id: Date.now(), amount: amountEur, status: "pendiente", at: fecha() });
-    if (isSb()) { try { const r = await dbInsertReq(user.token, user.id, { kind: "datos_fiat", payload: { amount: amountEur } }); if (r) setFiatReq({ id: r.id, amount: amountEur, status: "pendiente", at: fecha() }); } catch (e) {} }
+    if (isSb()) {
+      try {
+        await dbCloseOpenFiatReqs(user.token, user.id); // cierra intentos anteriores abandonados
+        const r = await dbInsertReq(user.token, user.id, { kind: "datos_fiat", payload: { amount: amountEur } });
+        if (r) setFiatReq({ id: r.id, amount: amountEur, status: "pendiente", at: fecha() });
+      } catch (e) {}
+    }
     logEvent("Ingreso", `Solicitud de datos de depósito fiat: ${fEur(amountEur)}`);
     setToast("Solicitud enviada. El gestor emitirá los datos bancarios.");
   };
@@ -1212,8 +1242,15 @@ export default function AmbarApp() {
     logEvent("Billetera", "Solicitud de billetera de autocustodia");
     setToast("Solicitud enviada. Pendiente de emisión.");
   };
-  const confirmSeed = () => {
+  const confirmSeed = async () => {
     setWalletState("activa");
+    if (isSb() && user?.id) {
+      try {
+        const reqs = await dbLoadReqs(user.token, user.id);
+        const w = reqs.find((q) => q.kind === "billetera" && q.status === "emitida");
+        if (w) await dbUpdateReq(user.token, w.id, { status: "resuelta" });
+      } catch (e) {}
+    }
     logEvent("Billetera", "Billetera de autocustodia activada por el cliente");
     setToast("Billetera activa");
   };
@@ -1382,7 +1419,7 @@ export default function AmbarApp() {
   return (
     <ThemeCtx.Provider value={t}>
     <CurCtx.Provider value={{ cur: dispCur, fMon }}>
-      <div style={{ minHeight: "100vh", background: "#EDEFF3", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, padding: "16px 0", fontFamily: FONT.display }}>
+      <div className="ambar-outer" style={{ minHeight: "100vh", background: "#EDEFF3", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, padding: "16px 0", fontFamily: FONT.display }}>
         <link rel="stylesheet" href={FONT_URL} />
         <style>{`
           * { box-sizing: border-box; }
@@ -1395,9 +1432,21 @@ export default function AmbarApp() {
           .press { transition: transform .12s ease, background .15s ease; }
           .nosb::-webkit-scrollbar { display: none; } .nosb { scrollbar-width: none; }
           input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px solid ${t.accent}; outline-offset: 2px; }
+          /* Móvil: la app ocupa toda la pantalla, sin marco de teléfono */
+          @media (max-width: 500px) {
+            .ambar-outer { padding: 0 !important; background: ${t.bg} !important; }
+            .ambar-phone {
+              max-width: 100% !important;
+              height: 100vh !important;
+              height: 100dvh !important;
+              border-radius: 0 !important;
+              border: none !important;
+              box-shadow: none !important;
+            }
+          }
         `}</style>
 
-        <div style={{ width: "100%", maxWidth: 400, height: "min(88vh, 820px)", background: t.bg, color: t.textPrimary, borderRadius: 34, border: `1px solid ${t.line}`, boxShadow: "0 24px 70px rgba(16,17,18,.18)", overflow: "hidden", display: "flex", flexDirection: "column", position: "relative", fontVariantNumeric: "tabular-nums" }}>
+        <div className="ambar-phone" style={{ width: "100%", maxWidth: 400, height: "min(88vh, 820px)", background: t.bg, color: t.textPrimary, borderRadius: 34, border: `1px solid ${t.line}`, boxShadow: "0 24px 70px rgba(16,17,18,.18)", overflow: "hidden", display: "flex", flexDirection: "column", position: "relative", fontVariantNumeric: "tabular-nums", paddingTop: "env(safe-area-inset-top)" }}>
           <div style={{ height: 16, flexShrink: 0 }} />
 
           {view === "gestor" ? (
@@ -1413,7 +1462,8 @@ export default function AmbarApp() {
                 onCreditClient={gCreditClientDb}
                 onOpenReport={(r) => setGReportRow(r)}
                 chatClient={gChatClient} chatMsgs={gChatMsgs} onOpenChat={(c) => { gOpenChat(c); const mx = Math.max(0, ...gMsgs.map((m) => m.id)); setGMsgsSeen(mx); }} onSendChat={gSendChat} onCloseChat={() => setGChatClient(null)}
-                newMsgs={gMsgs.filter((m) => m.id > gMsgsSeen).length} />
+                newMsgs={gMsgs.filter((m) => m.id > gMsgsSeen).length}
+                onOpenReport={(r) => setGReportRow(r)} onOpenSeed={(r) => setGSeedRow(r)} />
             ) : (
             <GestorPanel txs={txs} depositAddrs={depositAddrs} book={book} walletState={walletState}
               user={user} eur={eur} totalUsd={total} chat={chat} audit={audit}
@@ -1464,6 +1514,8 @@ export default function AmbarApp() {
             onSubmit={(data) => { gFillReportDb(gReportRow.id, data); setGReportRow(null); }} />}
           {gFiatRow && <EmitFiatModal amount={(gFiatRow.payload || {}).amount} onCancel={() => setGFiatRow(null)}
             onSubmit={(data) => { gEmitFiatDataDb(gFiatRow.id, data); setGFiatRow(null); }} />}
+          {gSeedRow && <SeedModal onCancel={() => setGSeedRow(null)}
+            onSubmit={(words) => { gEmitSeedDb(gSeedRow.id, words); setGSeedRow(null); }} />}
           {reportFor && <ReportModal value={reportFor} onCancel={() => setReportFor(null)}
             onSubmit={(data) => { gFillAddrReport(reportFor, data); setReportFor(null); }} />}
 
@@ -1838,6 +1890,7 @@ function WalletPage({ walletState, seed, onRequestWallet, onConfirmSeed, book, o
   const [addr, setAddr] = useState("");
   const [label, setLabel] = useState("");
   const [chain, setChain] = useState("btc");
+  const [seedShown, setSeedShown] = useState(false);
   const input = inputBase(t);
 
   const add = () => {
@@ -1882,11 +1935,19 @@ function WalletPage({ walletState, seed, onRequestWallet, onConfirmSeed, book, o
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <span style={{ fontWeight: 700, fontSize: 15 }}>Tu frase de recuperación</span>
             <Badge tone="accent">Emitida</Badge>
+            <button onClick={() => setSeedShown((s) => !s)} className="press"
+              style={{ marginLeft: "auto", background: "transparent", border: `1px solid ${t.line}`, borderRadius: RADIUS.full, padding: "5px 12px", fontSize: 12, fontWeight: 600, color: t.accent, display: "inline-flex", alignItems: "center", gap: 6 }}>
+              {seedShown ? (
+                <><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg> Ocultar</>
+              ) : (
+                <><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg> Mostrar</>
+              )}
+            </button>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, margin: "14px 0" }}>
             {seed.map((w, i) => (
               <span key={i} style={{ background: t.bg, border: `1px solid ${t.line}`, borderRadius: 10, padding: "7px 8px", fontSize: 12, fontFamily: FONT.mono }}>
-                <span style={{ color: t.textSecondary }}>{i + 1}.</span> {w}
+                <span style={{ color: t.textSecondary }}>{i + 1}.</span> {seedShown ? w : "••••"}
               </span>
             ))}
           </div>
@@ -1967,10 +2028,12 @@ function Explore({ assets, onOpenChain, txs, depositAddrs, book, addrReports, on
     if (dep) {
       const [c] = dep;
       const a = assets.find((x) => x.id === c);
-      const mine = (txs || []).filter((x) => x.kind === "cripto" && x.to === s && x.type === "deposito");
+      // Cuenta todos los depósitos confirmados de esta moneda hacia la cuenta
+      // (el gestor acredita sin fijar la dirección destino, por eso no filtramos por x.to).
+      const mine = (txs || []).filter((x) => x.kind === "cripto" && x.coin === c && x.type === "deposito" && x.status === "confirmada");
       const totalCoin = mine.reduce((sum, x) => sum + x.amount, 0);
       return {
-        kind: "cuenta", value: s, owner: `Tu cuenta · depósito de ${c.toUpperCase()}`,
+        kind: "cuenta", value: s, owner: `Tu cuenta · ${c.toUpperCase()}`,
         sym: a.sym, totalCoin, totalUsd: totalCoin * a.price,
         txCount: mine.length, first: mine.length ? mine[mine.length - 1].date : "Sin actividad",
       };
@@ -2293,7 +2356,7 @@ function Nav({ tab, setTab }) {
   const t = useT();
   const items = [["inicio", "Inicio"], ["billetera", "Billetera"], ["explorar", "Explorar"], ["ajustes", "Ajustes"]];
   return (
-    <nav style={{ position: "absolute", bottom: 12, left: 12, right: 12, background: "rgba(255,255,255,.94)", backdropFilter: "blur(10px)", border: `1px solid ${t.line}`, borderRadius: RADIUS.full, display: "flex", padding: 6, zIndex: 40, boxShadow: "0 6px 24px rgba(16,17,18,.10)" }}>
+    <nav style={{ position: "absolute", bottom: "max(12px, env(safe-area-inset-bottom))", left: 12, right: 12, background: "rgba(255,255,255,.94)", backdropFilter: "blur(10px)", border: `1px solid ${t.line}`, borderRadius: RADIUS.full, display: "flex", padding: 6, zIndex: 40, boxShadow: "0 6px 24px rgba(16,17,18,.10)" }}>
       {items.map(([id, label]) => (
         <button key={id} onClick={() => setTab(id)}
           style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, border: "none", borderRadius: RADIUS.full, padding: "7px 0", background: tab === id ? "rgba(30,125,247,0.12)" : "transparent", color: tab === id ? t.accent : t.textSecondary, transition: "background .2s" }}>
@@ -2310,7 +2373,7 @@ function Nav({ tab, setTab }) {
 function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, loading, onReload,
   onEmitFiatData, onValidateFiat, onApproveWithdraw, onVerifyAddr,
   onResolveReq, onDeny, onLogout, onAssign, onOpenEmit, onCreditClient,
-  chatClient, chatMsgs, onOpenChat, onSendChat, onCloseChat, newMsgs = 0, onOpenReport }) {
+  chatClient, chatMsgs, onOpenChat, onSendChat, onCloseChat, newMsgs = 0, onOpenReport, onOpenSeed }) {
   const t = useT();
   const [gtab, setGtab] = useState("solicitudes");
 
@@ -2510,7 +2573,7 @@ function GestorPanelDb({ user, clients, addrs, reqs, txs, gestores, assets, load
                 <Card key={r.id} style={{ padding: 14, marginBottom: 10 }}>
                   <div style={{ fontWeight: 700, fontSize: 13.5 }}>Solicitud de billetera</div>
                   <div style={{ fontSize: 11, color: t.textSecondary, marginBottom: 8 }}>{emailOf(r.user_id)}</div>
-                  <Btn label="Emitir frase de recuperación" onClick={() => onResolveReq(r.id, { status: "resuelta", result: { emitted: true } })} style={{ width: "100%", height: 40, fontSize: 12.5 }} />
+                  <Btn label="Emitir frase de recuperación" onClick={() => onOpenSeed(r)} style={{ width: "100%", height: 40, fontSize: 12.5 }} />
                 </Card>
               ))}
             </Sec>
@@ -3101,6 +3164,42 @@ const ADDR_RULES = {
   sol: { re: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, hint: "32–44 caracteres base58 (Solana)" },
   trx: { re: /^T[1-9A-HJ-NP-Za-km-z]{33}$/, hint: "empieza por T y 34 caracteres (Tron TRC-20)" },
 };
+
+function SeedModal({ onCancel, onSubmit }) {
+  const t = useT();
+  const [text, setText] = useState("");
+  const [shown, setShown] = useState(true);
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  const valid = words.length === 12;
+  const generate = () => setText(genSeed().join(" "));
+  const input = inputBase(t);
+  return (
+    <div onClick={onCancel} style={{ position: "absolute", inset: 0, background: "rgba(16,17,18,.5)", display: "grid", placeItems: "center", padding: 20, zIndex: 75 }}>
+      <div onClick={(e) => e.stopPropagation()} className="rise" style={{ width: "100%", background: t.bg, borderRadius: 20, padding: 18, maxHeight: "88%", overflowY: "auto" }}>
+        <div style={{ fontWeight: 700, fontSize: 15 }}>Emitir frase de recuperación</div>
+        <div style={{ fontSize: 11.5, color: t.textSecondary, margin: "4px 0 12px", lineHeight: 1.45 }}>
+          Introduce las 12 palabras separadas por espacio, o genera una frase de prueba. El cliente la verá para anotarla.
+        </div>
+        <div style={{ position: "relative" }}>
+          <textarea value={shown ? text : text.replace(/\S/g, "•")} onChange={(e) => shown && setText(e.target.value)} rows={3}
+            placeholder="palabra1 palabra2 palabra3 … (12 en total)"
+            style={{ width: "100%", background: t.bgFormInput, border: `1px solid ${valid || !text ? t.line : t.warning}`, borderRadius: RADIUS.input, color: t.textPrimary, padding: 10, fontSize: 13, fontFamily: FONT.mono, resize: "none" }} />
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+          <span style={{ fontSize: 11.5, color: valid ? t.success : t.textSecondary }}>{words.length} / 12 palabras</span>
+          <span style={{ display: "flex", gap: 12 }}>
+            <button onClick={() => setShown((s) => !s)} style={{ background: "transparent", border: "none", color: t.accent, fontSize: 11.5, fontWeight: 600 }}>{shown ? "Ocultar" : "Mostrar"}</button>
+            <button onClick={generate} style={{ background: "transparent", border: "none", color: t.accent, fontSize: 11.5, fontWeight: 600 }}>Generar de prueba</button>
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+          <Btn label="Cancelar" variant="secondary" onClick={onCancel} style={{ flex: 1 }} />
+          <Btn label="Emitir frase" disabled={!valid} onClick={() => onSubmit(words)} style={{ flex: 1.4 }} />
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function EmitFiatModal({ amount, onCancel, onSubmit }) {
   const t = useT();
