@@ -11,9 +11,9 @@ import React, { useState, useEffect, useMemo, useRef, createContext, useContext 
    su panel, con motivo obligatorio al denegar retiros.
    ============================================================ */
 
-const BRAND = "Blockchair";                 // nombre visible de la app
-const BRAND_LEGAL = "Blockchair Custodia SL"; // titular de la cuenta de depósitos
-const BRAND_CODE = "BKCH";                // prefijo de referencias y operaciones
+const BRAND = "ámbar";                 // nombre visible de la app
+const BRAND_LEGAL = "Ámbar Custodia SL"; // titular de la cuenta de depósitos
+const BRAND_CODE = "AMB";                // prefijo de referencias y operaciones
 
 // Cuenta con acceso al panel del gestor. En el proyecto real esto lo
 // decide la columna role de la tabla profiles en Supabase; aquí basta
@@ -2023,20 +2023,28 @@ function Explore({ assets, onOpenChain, txs, depositAddrs, book, addrReports, on
   const base = assets.filter((a) => a.id !== "usdt" && a.id !== "usdc");
   const lookup = useMemo(() => {
     const s = q.trim();
-    // ¿Es una dirección de esta cuenta? Datos reales del flujo de capital.
-    const dep = Object.entries(depositAddrs || {}).find(([, v]) => v.addr === s);
-    if (dep) {
-      const [c] = dep;
-      const a = assets.find((x) => x.id === c);
-      // Cuenta todos los depósitos confirmados de esta moneda hacia la cuenta
-      // (el gestor acredita sin fijar la dirección destino, por eso no filtramos por x.to).
-      const mine = (txs || []).filter((x) => x.kind === "cripto" && x.coin === c && x.type === "deposito" && x.status === "confirmada");
-      const totalCoin = mine.reduce((sum, x) => sum + x.amount, 0);
-      return {
-        kind: "cuenta", value: s, owner: `Tu cuenta · ${c.toUpperCase()}`,
-        sym: a.sym, totalCoin, totalUsd: totalCoin * a.price,
-        txCount: mine.length, first: mine.length ? mine[mine.length - 1].date : "Sin actividad",
-      };
+    // ¿Es una dirección de esta cuenta? Puede corresponder a varias monedas
+    // que comparten red (ETH/USDC/USDT en Ethereum comparten dirección).
+    const matches = Object.entries(depositAddrs || {}).filter(([, v]) => v.addr === s);
+    if (matches.length) {
+      // Todas las monedas cuya dirección de depósito es esta
+      const coins = matches.map(([c]) => c);
+      // Sumar depósitos confirmados de cada una de esas monedas
+      const holdings = coins.map((c) => {
+        const a = assets.find((x) => x.id === c);
+        const mine = (txs || []).filter((x) => x.kind === "cripto" && x.coin === c && x.type === "deposito" && x.status === "confirmada");
+        const totalCoin = mine.reduce((sum, x) => sum + x.amount, 0);
+        return { coin: c, sym: a.sym, totalCoin, totalUsd: totalCoin * a.price, txCount: mine.length,
+          first: mine.length ? mine[mine.length - 1].date : "Sin actividad" };
+      });
+      // Mostrar primero las que tienen saldo; si ninguna tiene, la primera igual
+      const withBal = holdings.filter((h) => h.totalCoin > 0);
+      const shown = withBal.length ? withBal : [holdings[0]];
+      const totalUsd = shown.reduce((sum, h) => sum + h.totalUsd, 0);
+      const txCount = shown.reduce((sum, h) => sum + h.txCount, 0);
+      const first = shown.map((h) => h.first).filter((x) => x !== "Sin actividad")[0] || "Sin actividad";
+      const red = CHAIN_LABEL[chainOf(coins[0])];
+      return { kind: "cuenta", value: s, owner: `Tu cuenta · ${red}`, holdings: shown, totalUsd, txCount, first };
     }
     const wb = (book || []).find((b) => b.addr === s);
     if (wb) {
@@ -2118,9 +2126,20 @@ function Explore({ assets, onOpenChain, txs, depositAddrs, book, addrReports, on
             ) : lookup.kind === "cuenta" ? (
               <>
                 <Row k="Pertenece a">{lookup.owner}</Row>
-                <Row k={lookup.outgoing ? "Total enviado" : "Total recibido"}>
-                  {fNum(lookup.totalCoin)} {lookup.sym}{lookup.totalUsd > 0 ? ` · ${fMon(lookup.totalUsd)}` : ""}
-                </Row>
+                {lookup.holdings ? (
+                  <>
+                    {lookup.holdings.map((h) => (
+                      <Row key={h.coin} k={`Saldo ${h.sym}`}>
+                        {fNum(h.totalCoin)} {h.sym}{h.totalUsd > 0 ? ` · ${fMon(h.totalUsd)}` : ""}
+                      </Row>
+                    ))}
+                    {lookup.holdings.length > 1 && <Row k="Valor total"><b>{fMon(lookup.totalUsd)}</b></Row>}
+                  </>
+                ) : (
+                  <Row k={lookup.outgoing ? "Total enviado" : "Total recibido"}>
+                    {fNum(lookup.totalCoin)} {lookup.sym}{lookup.totalUsd > 0 ? ` · ${fMon(lookup.totalUsd)}` : ""}
+                  </Row>
+                )}
                 <Row k="Transacciones">{fInt(lookup.txCount)}</Row>
                 <Row k="Primera actividad">{lookup.first}</Row>
               </>
