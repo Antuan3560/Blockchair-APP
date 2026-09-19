@@ -11,8 +11,8 @@ import React, { useState, useEffect, useMemo, useRef, createContext, useContext 
    su panel, con motivo obligatorio al denegar retiros.
    ============================================================ */
 
-const BRAND = "ámbar";                 // nombre visible de la app
-const BRAND_LEGAL = "Ámbar Custodia SL"; // titular de la cuenta de depósitos
+const BRAND = "Blockchair";                 // nombre visible de la app
+const BRAND_LEGAL = "Blockchair Custodia SL"; // titular de la cuenta de depósitos
 const BRAND_CODE = "AMB";                // prefijo de referencias y operaciones
 
 // Cuenta con acceso al panel del gestor. En el proyecto real esto lo
